@@ -54,6 +54,8 @@ def _engine_candidates():
         # 项目级安装
         os.path.join(os.getcwd(), ".claude", "skills", name, "scripts"),
         os.path.join(os.getcwd(), ".agents", "skills", name, "scripts"),
+        # 仓库内自带引擎：克隆后不安装也能直接跑
+        os.path.join(HERE, "..", "engine", "scripts"),
     ]
 
 
