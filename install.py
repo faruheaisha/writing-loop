@@ -86,6 +86,10 @@ def main():
     print("已装 %s" % SKILL_NAME)
     if os.path.isdir(ENGINE_SRC):
         copy_skill(ENGINE_SRC, engine_dst)
+        # 仓库里引擎的 SKILL.md 存成 .template，避免被技能扫描器当嵌套技能索引
+        tpl = os.path.join(engine_dst, "SKILL.md.template")
+        if os.path.isfile(tpl):
+            os.replace(tpl, os.path.join(engine_dst, "SKILL.md"))
         print("已装 %s" % ENGINE_NAME)
 
     if not a.no_weights:
