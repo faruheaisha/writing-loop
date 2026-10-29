@@ -2,15 +2,23 @@
 
 中文写作质检工作台：按场景定位写作，按规则扫描模型腔，跑本地 AI 检测，按分段定位要改的段落，复检到收敛。附风格画像与风格卡，给模型提供你自己的写作参照。
 
-## 装在哪
+## 一键安装
 
-把本目录放进任一技能的技能目录：
+```bash
+git clone https://github.com/faruheaisha/writing-loop.git
+cd writing-loop
+python install.py
+```
 
-- WorkBuddy：`~/.workbuddy/skills/`
-- Claude Code：`~/.claude/skills/`
-- Codex：`~/.agents/skills/`
+脚本会自动探测技能目录（`~/.workbuddy/skills`、`~/.claude/skills`、`~/.agents/skills`、`~/.codex/skills`，或项目级 `.claude/skills`），装好本技能与检测引擎，下载权重，跑一遍自测。
 
-项目级安装放 `.claude/skills/` 或 `.agents/skills/` 即可。
+```bash
+python install.py --target ~/.claude/skills   # 指定目录
+python install.py --no-weights                # 离线安装，只用扫描功能
+python install.py --uninstall                 # 卸载
+```
+
+克隆后不装也能直接跑：检测引擎已随仓库附带，`scripts/` 会自动找到 `engine/`。
 
 ## 立刻能跑
 
@@ -28,7 +36,7 @@ python <本目录>/tests/run_tests.py
 ## 两层结构
 
 1. **本技能**：扫描、守卫、场景模型、风格画像。零第三方依赖，Python 3.10 以上。
-2. **检测引擎组件**：中文 RoBERTa 二分类器，int4 权重 60MB。首装跑该组件自己的 `scripts/download.py`，约 6 到 7 分钟。引擎在五种安装位置与项目级目录都会被自动发现。
+2. **检测引擎**（`engine/`）：中文 RoBERTa 二分类器，int4 权重 60MB。代码随仓库附带，权重需首次下载（约 6 到 7 分钟），也可离线安装后单独下载。
 
 ## 画像需要你自己的旧稿
 
