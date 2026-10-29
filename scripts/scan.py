@@ -182,7 +182,9 @@ ZERO_SUBJ_OK = re.compile(
     r"^(?:这|那|它|其|此|该|因此|所以|但|而|于是|结果|最终|后来|"
     r"值得|进一步|此外|同时|另外|首先|其次|再次|总之|换言之|"
     r"从|在|对|关于|通过|由于|随着|就|至于|如果说|相比|相较于|按照|依据|针对)")
-PRED = re.compile(r"是|在|有|为|需要|应该|意味")
+# 谓词判定收紧：只看真正的判断句谓语。原来把「在」「有」也算进去，导致
+# 「代码在 GitHub 上开源了」这类有主语的正常句首被误判为零主语评论。
+PRED = re.compile(r"是|需要|应该|意味着|并非|就是|之所以")
 
 
 def split_sents(t):
@@ -343,7 +345,8 @@ def scan(text, samples=3, whitelist=None, profile=None):
         if not ps:
             continue
         head = ps[0]
-        if len(head) >= 6 and not ZERO_SUBJ_OK.match(head) and PRED.search(head):
+        if (len(head) >= 6 and not ZERO_SUBJ_OK.match(head)
+                and "在" not in head and PRED.search(head)):
             zs += 1
     if len(nonfirst) >= 5:
         zr = zs / len(nonfirst) * 100
