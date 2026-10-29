@@ -175,7 +175,7 @@ python $S/tests/run_tests.py
 本技能分两层，都要装：
 
 1. **本技能**（writing-loop）：机械扫描、守卫、画像与风格卡，零第三方依赖，Python 3.10 以上即可。
-2. **检测引擎**（xiaoyu-chinese-ai-detect）：中文 RoBERTa 二分类器，int4 权重 60MB。首次使用跑**检测引擎组件**的 `scripts/download.py` 拉权重（该组件目录下的脚本，不在本目录），并安装 torch 与 transformers，约 6 到 7 分钟。
+2. **检测引擎**（engine/，安装名为 xiaoyu-chinese-ai-detect）：中文 RoBERTa 二分类器，int4 权重 60MB。首次使用跑**检测引擎组件**的 `scripts/download.py` 拉权重（该组件目录下的脚本，不在本目录），并安装 torch 与 transformers，约 6 到 7 分钟。
 
 引擎在 ~/.workbuddy、~/.claude、~/.agents、~/.codex 及项目级 .claude、.agents 目录下都会被自动发现，装在哪一层都行。检测不到时 `loop.py` 会明确报错，机械扫描不受影响照常可用。
 
