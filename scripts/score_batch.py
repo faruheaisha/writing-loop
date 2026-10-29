@@ -34,6 +34,7 @@ def _engine_candidates():
         os.path.join(home, ".codex", "skills", name, "scripts"),
         os.path.join(os.getcwd(), ".claude", "skills", name, "scripts"),
         os.path.join(os.getcwd(), ".agents", "skills", name, "scripts"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine", "scripts"),
     ]
 
 
