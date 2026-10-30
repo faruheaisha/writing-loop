@@ -1,0 +1,13 @@
+# 全仓文本强制 LF 换行，防止 Windows CRLF 破坏 SKILL.md 的 YAML frontmatter 解析与引擎哈希
+* text=auto eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.template text eol=lf
+
+# 模型权重为二进制
+*.pt binary
+*.bin binary
+*.safetensors binary

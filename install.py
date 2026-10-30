@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""一键安装：把本技能与检测引擎装进任一技能的技能目录。
+# Copyright (C) 2026 faruheaisha
+# SPDX-License-Identifier: GPL-3.0-only
+"""一键安装：默认以单技能内嵌模式安装 writing-loop（含内嵌 engine/），避免双技能触发冲突与常驻膨胀。
 
 用法
-  python install.py                     # 自动探测目标，下载权重，跑自测
+  python install.py                       # 自动探测目标，单技能内嵌安装，按需拉取权重，跑全量自测
   python install.py --target ~/.claude/skills
-  python install.py --no-weights        # 只装文件不拉权重（离线可用扫描）
-  python install.py --uninstall
+  python install.py --no-weights          # 离线安装，只装代码与规则（扫描与画像立即可用）
+  python install.py --standalone-engine   # 可选：额外暴露同级独立的 xiaoyu-chinese-ai-detect 技能
+  python install.py --uninstall           # 卸载
 
 目标目录探测顺序：~/.workbuddy/skills、~/.claude/skills、~/.agents/skills、~/.codex/skills
 """
@@ -16,11 +19,23 @@ import shutil
 import subprocess
 import sys
 
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE_SRC = os.path.join(HERE, "engine")
 SKILL_NAME = "writing-loop"
 ENGINE_NAME = "xiaoyu-chinese-ai-detect"
 RUNTIMES = [".workbuddy", ".claude", ".agents", ".codex"]
+
+DEV_SKIP_EXACT = {
+    "install.py",
+    "writing_loop_2.0_deep_research_and_plan.md",
+    "writing_loop_knowledge_base.csv",
+}
 
 
 def candidates():
@@ -37,7 +52,6 @@ def pick_target(explicit):
     for c in candidates():
         if os.path.isdir(c):
             return c, "已存在"
-    # 都没有就选第一个可写的
     for c in candidates():
         try:
             os.makedirs(c, exist_ok=True)
@@ -48,23 +62,49 @@ def pick_target(explicit):
     return None, None
 
 
-def copy_skill(src, dst, skip=()):
+def copy_skill(src, dst, extra_skip=()):
     shutil.rmtree(dst, ignore_errors=True)
+    skip_set = set(extra_skip) | DEV_SKIP_EXACT
 
     def _ignore(directory, names):
+        is_root = os.path.abspath(directory) == os.path.abspath(src)
         out = set()
         for n in names:
-            if n in (".git", "__pycache__") or n.endswith(".pyc") or n in skip:
+            if n == "__pycache__" or n.endswith((".pyc", ".tmp")):
+                out.add(n)
+            elif n.startswith(".") or n.startswith("specs_"):
+                out.add(n)
+            elif is_root and n in skip_set:
                 out.add(n)
         return out
 
     shutil.copytree(src, dst, ignore=_ignore)
 
 
+def _preserve_legacy_weights(legacy_engine_dst, embedded_engine_dst):
+    """若旧版同级独立引擎目录内放有离线权重，迁移至内嵌引擎 assets/ 后再清理。"""
+    src_assets = os.path.join(legacy_engine_dst, "assets")
+    dst_assets = os.path.join(embedded_engine_dst, "assets")
+    if not os.path.isdir(src_assets):
+        return
+    os.makedirs(dst_assets, exist_ok=True)
+    for fn in os.listdir(src_assets):
+        if fn.endswith(".pt") or fn == "fp32":
+            s_p = os.path.join(src_assets, fn)
+            d_p = os.path.join(dst_assets, fn)
+            if not os.path.exists(d_p):
+                if os.path.isdir(s_p):
+                    shutil.copytree(s_p, d_p)
+                else:
+                    shutil.copy2(s_p, d_p)
+
+
 def main():
     ap = argparse.ArgumentParser(description="writing-loop 一键安装")
     ap.add_argument("--target", default=None, help="技能目录根，缺省自动探测")
     ap.add_argument("--no-weights", action="store_true", help="不下载检测引擎权重")
+    ap.add_argument("--standalone-engine", action="store_true",
+                    help="同时安装独立的 xiaoyu-chinese-ai-detect 同级技能（默认内嵌防触发冲突）")
     ap.add_argument("--uninstall", action="store_true", help="卸载")
     a = ap.parse_args()
 
@@ -82,28 +122,35 @@ def main():
         return 0
 
     print("目标目录：%s（%s）" % (target, how))
-    copy_skill(HERE, skill_dst, skip=("engine",))
-    print("已装 %s" % SKILL_NAME)
-    if os.path.isdir(ENGINE_SRC):
+    # 默认把 engine/ 内嵌在 writing-loop/engine/ 内（保留 SKILL.md.template 后缀，不产生重复技能索引）
+    copy_skill(HERE, skill_dst)
+    embedded_engine = os.path.join(skill_dst, "engine")
+    print("已装 %s（含内嵌检测引擎）" % SKILL_NAME)
+
+    if a.standalone_engine and os.path.isdir(ENGINE_SRC):
         copy_skill(ENGINE_SRC, engine_dst)
-        # 仓库里引擎的 SKILL.md 存成 .template，避免被技能扫描器当嵌套技能索引
         tpl = os.path.join(engine_dst, "SKILL.md.template")
         if os.path.isfile(tpl):
             os.replace(tpl, os.path.join(engine_dst, "SKILL.md"))
-        print("已装 %s" % ENGINE_NAME)
+        print("已额外部署独立技能 %s" % ENGINE_NAME)
+    elif os.path.isdir(engine_dst):
+        _preserve_legacy_weights(engine_dst, embedded_engine)
+        shutil.rmtree(engine_dst, ignore_errors=True)
+        print("已收敛旧版同级目录 %s（消除双技能触发碰撞）" % ENGINE_NAME)
 
+    active_engine = engine_dst if (a.standalone_engine and os.path.isdir(engine_dst)) else embedded_engine
     if not a.no_weights:
-        dl = os.path.join(engine_dst, "scripts", "download.py")
+        dl = os.path.join(active_engine, "scripts", "download.py")
         if os.path.isfile(dl):
-            print("正在下载检测引擎权重，约需数分钟……")
+            print("检查并按需拉取检测引擎权重……")
             try:
-                subprocess.run([sys.executable, dl], cwd=engine_dst, check=False)
-            except Exception as e:
-                print("权重下载出错，可稍后手动执行：python %s" % dl)
+                subprocess.run([sys.executable, dl], cwd=active_engine, check=False)
+            except Exception:
+                print("权重拉取未完成，可稍后手动执行：python %s" % dl)
         else:
             print("找不到下载脚本，跳过权重")
     else:
-        print("已跳过权重下载（检测功能暂不可用，扫描功能正常）")
+        print("已跳过权重下载（章法、扫描与画像立即可用）")
 
     test = os.path.join(skill_dst, "tests", "run_tests.py")
     if os.path.isfile(test):
@@ -111,10 +158,11 @@ def main():
         subprocess.run([sys.executable, test], cwd=skill_dst, check=False)
 
     print()
-    print("完成。用法：")
-    print("  python %s/scripts/scan.py 稿件.txt" % skill_dst)
-    print("  python %s/scripts/loop.py 稿件.txt" % skill_dst)
-    print("  python %s/scripts/style_profile.py build 你的旧稿目录/ --name self" % skill_dst)
+    print("完成。常用命令：")
+    print("  python \"%s/scripts/kickoff.py\" \"写作主题\" --scene 杂文随笔" % skill_dst)
+    print("  python \"%s/scripts/scan.py\" 稿件.md --outline" % skill_dst)
+    print("  python \"%s/scripts/loop.py\" 稿件.md" % skill_dst)
+    print("  python \"%s/scripts/style_profile.py\" build 你的旧稿目录/ --name self" % skill_dst)
     return 0
 
 

@@ -1,5 +1,13 @@
 __pycache__/
 *.pyc
+*.pyo
+*.tmp
+.pytest_cache/
 .DS_Store
 Thumbs.db
 profiles/
+specs_*/
+.claude/
+.agents/
+.workbuddy/
+.codex/

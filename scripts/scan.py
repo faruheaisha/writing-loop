@@ -1,50 +1,88 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""writing-loop 机械扫描器
+# Copyright (C) 2026 faruheaisha
+# SPDX-License-Identifier: GPL-3.0-only
+"""writing-loop 机械扫描器（v2.2：行号定位 + 对抗防穿透 + Markdown 免疫 + 跨格式读取 + 首句大纲）
 
 每条规则标依据等级：
-  paired    270 对同题同事实配对复测，双侧显著（lieflat RESEARCH.md）
-  corpus    单侧语料频次统计，无人类对照（晓语口癖榜）
+  paired    270 对同题同事实配对复测，双侧显著（lieflat RESEARCH.md / sepia）
+  corpus    单侧语料频次统计，无人类对照（晓语口癖榜 / Humanizer）
   release   随模型版本变化，不是稳定特征（sepia style-pass §7）
-  editorial 编辑经验，属文体问题不属 AI 特征
+  editorial 编辑经验与现代汉语规范，属文体或文字功底问题
 
 四条跨项目收敛的判定纪律：
-  1 单次命中不算信号，要聚类（sepia：one hit means nothing）
+  1 单次命中不算信号，要聚类（sepia：one hit means nothing；S 级除外）
   2 结构指标的分母是同类元素总数，不是字数（lieflat 六次失误第 5 条）
-  3 引号内与白名单内不计入（sepia 白名单 / novel-studio .deslop-whitelist）
+  3 引号内、白名单内与 Markdown 非正文结构块不计入
   4 短文按双门判定，最小命中数与密度同时满足才报（oh-story 双门）
 
 用法
-  python scan.py 文件.txt [--json] [--whitelist 白名单.txt] [--samples N]
+  python scan.py 稿件.md [--json] [--outline] [--whitelist 白名单.txt] [--samples N]
+  python scan.py 稿件.docx
   python scan.py --text "正文"
 """
 import argparse
-import io
+import bisect
+import html
 import json
 import os
 import re
 import statistics
 import sys
+import zipfile
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 TH_PARA_ISO2 = 4.81     # 连续两句同构，每百段。人类 4.81 / AI 9.41
 TH_PARA_ISO3 = 0.41     # 连续三句同构，每百段。人类 0.41 / AI 0.84
 TH_ZERO_SUBJ = 0.14     # 段首零主语评论，占非首段百分比。人类 0.14 / AI 0.61
 SHORT_TEXT = 500        # 低于此字数启用双门（最小命中数）
 
+TEXT_EXT = (".md", ".txt", ".markdown")
+DOCX_EXT = (".docx",)
+
+
+def read_docx(path):
+    """从 .docx 提取纯文本：解包 word/document.xml，保留段落与换行，反转义 XML 实体。"""
+    with zipfile.ZipFile(path) as z:
+        xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
+    xml = re.sub(r"</w:p>|<w:br[^>]*/?>", "\n", xml)
+    txt = html.unescape(re.sub(r"<[^>]+>", "", xml))
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\n{3,}", "\n\n", txt)
+
+
+def read_text(path):
+    """跨格式安全读取器：支持 .docx/.md/.txt，自动剥离文件首字节 UTF-8 BOM（保留正中零宽检测），回退 gb18030。"""
+    if path.lower().endswith(DOCX_EXT):
+        return read_docx(path)
+    with open(path, "rb") as f:
+        raw = f.read()
+    # 仅剥离文件头首字节 UTF-8 BOM (EF BB BF)，正文中间夹带的 U+FEFF 仍保留供零宽作弊拦截
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        txt = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        txt = raw.decode("gb18030", errors="replace")
+    return txt.replace("\r\n", "\n").replace("\r", "\n")
+
+
 # min_hits: 双门的最小命中数。短文放大倍数，防小基数误报
 RULES = [
     dict(id="flip", tier="S", basis="paired", name="翻案腔（不是A而是B）",
-         pat=r"(?:不是|并非|不在于|不只是|不仅仅是|与其说)[^，。！？\n]{1,20}[，]?(?:而是|而在于|不如说|更是)",
+         pat=r"(?:不是|并非|绝非|不在于)[^。！？；\n]{1,34}?(?:而是|而在于)|"
+             r"与其说[^。！？；\n]{1,34}?(?:不如说|毋宁说)|"
+             r"(?:不只是|不仅仅是|不光(?:是)?|不单(?:是)?)[^。！？；\n]{1,30}?(?:更是|而且是)",
          per_kilo=0, min_hits=1,
          advice="删掉否定的一半，直接说正面。若否定部分在纠正真实误解才保留。",
          src="lieflat 配对 δ+0.88/+0.72；晓语口癖榜第 1 位 688 次"),
     dict(id="escalate", tier="S", basis="corpus", name="递增对比（不仅…更…）",
-         pat=r"不仅[^，。]{1,30}[，]?(?:更|还)[^，。]{1,20}(?:体现|作用|意味|在于|是)",
+         pat=r"不仅[^，。！？；\n]{1,30}[，]?(?:更|还)[^，。！？；\n]{1,20}(?:体现|作用|意味|在于|是)",
          per_kilo=0, min_hits=1, advice="两件事并列说清楚，不用递进造势。",
          src="晓语口癖榜第 10 位 66 次"),
     dict(id="opener", tier="S", basis="corpus", name="套话开头",
@@ -70,6 +108,15 @@ RULES = [
          pat=r"我(?:无法|不能)(?:确定|保证|核实)|仅供参考[，。]|请以(?:官方|实际)(?:为准|发布)",
          per_kilo=0, min_hits=1, advice="不确定就说不确定，不要用模板化免责句兜底。",
          src="blader/humanizer §23"),
+    dict(id="idiom_misuse", tier="S", basis="editorial", name="成语高频误用",
+         pat=r"昨日黄花|无时无刻(?:都在|都(?![不未没无]))|"
+             r"(?:只能|可以|能够|足以|完全可以)望其项背|"
+             r"炙手可热的[^，。！？\n]{0,8}(?:商品|产品|单品|爆款|车型|机型|楼盘|赛道)|"
+             r"首当其冲(?:地)?(?:带领|引领|冲在|挑大梁|扛起)|"
+             r"七月流火[^，。！？\n]{0,8}(?:酷暑|高温|骄阳|烈日|热浪|炎炎)",
+         per_kilo=0, min_hits=1,
+         advice="核准成语原义：作『明日黄花』；『无时无刻』须配『不』；『望其项背』只用于否定或反问；『炙手可热』指权势盛；『首当其冲』指最先受冲击；『七月流火』指暑退转凉。",
+         src="Chengyu-Bench (arXiv:2506.18105)；章法与手法 §四.4"),
 
     dict(id="colon_hint", tier="A", basis="paired", name="提示语冒号（核心是：）",
          pat=r"(?:核心|关键|本质|问题|答案|结论)(?:问题|点|区别|原因|矛盾|要害)?"
@@ -103,34 +150,43 @@ RULES = [
          per_kilo=1.0, min_hits=2, advice="给条件：在什么前提下这是最优解。",
          src="晓语口癖榜第 3、6 位；思辨 C11"),
     dict(id="either", tier="A", basis="corpus", name="要么…要么…",
-         pat=r"要么[^，。]{1,25}要么", per_kilo=0.5, min_hits=2,
+         pat=r"要么[^，。！？；\n]{1,25}要么", per_kilo=0.5, min_hits=2,
          advice="列第三选项，说明前两个为什么不够。", src="Purdue either/or；思辨 C29"),
     dict(id="advice", tier="A", basis="corpus", name="我的建议是 / 记住",
          pat=r"我的建议是|建议(?:你|大家|各位)?直接|记住[，：:]", per_kilo=0.5, min_hits=2,
          advice="给建议带适用条件和不适用的情况。", src="晓语口癖榜第 7、12 位"),
     dict(id="evenif", tier="A", basis="corpus", name="就算…也…",
-         pat=r"就算[^，。]{1,25}也", per_kilo=0.5, min_hits=2,
+         pat=r"就算[^，。！？；\n]{1,25}也", per_kilo=0.5, min_hits=2,
          advice="具体让步加具体反驳。", src="晓语口癖榜第 13 位"),
     dict(id="whybecause", tier="A", basis="corpus", name="之所以…是因为…",
-         pat=r"之所以[^，。]{1,40}是因为", per_kilo=1.0, min_hits=2,
+         pat=r"之所以[^，。！？；\n]{1,40}是因为", per_kilo=1.0, min_hits=2,
          advice="拆两句：先现象后原因。", src="晓语口癖榜第 16 位"),
     dict(id="frankly", tier="A", basis="corpus", name="说实话 / 说白了",
          pat=r"说实话|说白了|坦白说", per_kilo=1.0, min_hits=2,
          advice="整篇不超过一处。", src="晓语口癖榜第 1、17 位"),
+    dict(id="inflated_sig", tier="A", basis="corpus", name="抬高意义（标志着/见证了）",
+         pat=r"标志(?:着|性)|见证了|具有里程碑|开启(?:了)?新(?:的)?(?:篇章|阶段|局面)|"
+             r"未来可期|前景广阔|彰显(?:了|出)|折射出|体现出[^，。！？；\n]{0,8}(?:重要性|价值|意义)|"
+             r"画上(?:了)?(?:圆满的)?句号|注入(?:了)?(?:新|强劲)(?:的)?(?:动力|活力)",
+         per_kilo=0.5, min_hits=2,
+         advice="把意义删掉，只留事实，停在最后一个具体事实上。"
+                "「标志着里程碑」这类话是把普通细节说成转折、证明或承诺。",
+         src="blader/humanizer §13 inflated significance"),
 
     dict(id="abstract_pass", tier="B", basis="paired", name="过长前置定语",
-         pat=r"[^，。！？\n]{12,}的[一-龥]{2,4}(?:是|在于|成为|意味着)",
+         pat=r"[^，。！？；\n]{12,60}的[一-龥]{2,4}(?:是|在于|成为|意味着)",
          per_kilo=0.42, min_hits=2, advice="拆成两句，或把定语后置。",
          src="lieflat 配对收录，人类侧差 2.6 到 5.3 倍"),
     dict(id="whenthen", tier="B", basis="paired", name="当…时 / 在…的过程中",
-         pat=r"当[^，。]{2,20}时[，]|在[^，。]{2,20}的过程中", per_kilo=0.26, min_hits=2,
+         pat=r"当[^，。！？；\n]{2,20}时[，]|在[^，。！？；\n]{2,20}的过程中", per_kilo=0.26, min_hits=2,
          advice="改成具体时点，或直接删。", src="lieflat 配对收录"),
     dict(id="nominal", tier="B", basis="paired", name="抽象后缀词（性/化/度）",
          pat=r"[一-龥]{2}(?:性|化|度)(?:[，。、；])", per_kilo=4.0, min_hits=3,
          advice="AI 比人类多 1.6 倍，可删就删。",
          src="lieflat：改用抽象后缀词测才成立，动词名词化本身人类更多"),
     dict(id="dedede", tier="B", basis="paired", name="层叠的的",
-         pat=r"的[一-龥]{0,4}的[一-龥]{0,4}的", per_kilo=0.06, min_hits=1,
+         pat=r"(?<!目的)(?<!标的)的(?!确)[一-龥]{0,4}(?<!目的)(?<!标的)的(?!确)[一-龥]{0,4}(?<!目的)(?<!标的)的(?!确)",
+         per_kilo=0.06, min_hits=1,
          advice="拆开长定语，注意别跨顿号误判正常并列。",
          src="lieflat 收紧后 0.06/千字"),
     dict(id="connector", tier="B", basis="paired", name="连接词密度",
@@ -141,7 +197,7 @@ RULES = [
          pat=r"微微|淡淡|缓缓|轻轻|默默|静静", per_kilo=3.0, min_hits=3,
          advice="每千字超过 3 个再动。", src="novel-studio 阈值原文"),
     dict(id="onesent", tier="B", basis="corpus", name="单句成段（戏剧性碎片）",
-         pat=r"(?m)^[^\n]{1,12}[。！？]\s*$",
+         pat=r"(?m)^[^\n￭]{1,12}[。！？]\s*$",
          per_kilo=1.0, min_hits=3,
          advice="单句成段是制造停顿的手法，连用三次就成了节奏模板。合并其中一两句。",
          src="blader/humanizer §2"),
@@ -152,16 +208,8 @@ RULES = [
          per_kilo=1.0, min_hits=2,
          advice="这是叙事文里最典型的机器收束。停在此刻的动作或一句对话上，不要替读者总结意义。",
          src="oh-story abstract-summary-tic（七条正则，双门 3 次加每千字 4 次）"),
-    dict(id="inflated_sig", tier="A", basis="corpus", name="抬高意义（标志着/见证了）",
-         pat=r"标志(?:着|性)|见证了|具有里程碑|开启(?:了)?新(?:的)?(?:篇章|阶段|局面)|"
-             r"未来可期|前景广阔|彰显(?:了|出)|折射出|体现出[^，。]{0,8}(?:重要性|价值|意义)|"
-             r"画上(?:了)?(?:圆满的)?句号|注入(?:了)?(?:新|强劲)(?:的)?(?:动力|活力)",
-         per_kilo=0.5, min_hits=2,
-         advice="把意义删掉，只留事实，停在最后一个具体事实上。"
-                "「标志着里程碑」这类话是把普通细节说成转折、证明或承诺。",
-         src="blader/humanizer §13 inflated significance"),
     dict(id="heading_echo", tier="B", basis="corpus", name="小标题在首句重复",
-         pat=r"(?m)^#{1,6}\s*([^\n]{2,12})\n+(?:[^\n]{0,6})\1",
+         pat=r"(?m)^#{1,6}[ \t]+(?:[一二三四五六七八九十\d]+[、.． \t]+)?([^\n#]{2,14}?)[ \t]*\n+(?:[^\n]{0,6})\1",
          per_kilo=0.2, min_hits=1,
          advice="删掉小标题下面那句重复标题的话，直接进内容。",
          src="blader/humanizer §24 heading repeated in first sentence"),
@@ -171,28 +219,205 @@ RULES = [
          per_kilo=1.0, min_hits=2,
          advice="换成谁在什么时间做了什么、花了多少、效果差多少。",
          src="编辑经验，非 AI 特征，属文体问题"),
+    dict(id="dead_meta", tier="B", basis="editorial", name="塑料死喻堆叠",
+         pat=r"时代的齿轮|命运的(?:齿轮|棋局)|心灵的(?:灯塔|港湾)|破茧成蝶|"
+             r"双刃剑|硬币的两面|冰山一角|压死骆驼的最后一根稻草|多米诺骨牌|历史的车轮",
+         per_kilo=0.5, min_hits=2,
+         advice="死喻已被机器语料磨平。字面能说清就直说；真要用比喻，取手边具体器物或工序单点咬合。",
+         src="章法与手法 §三.2；Anthropic Mannered Prose"),
+    dict(id="somatic_cliche", tier="B", basis="paired", name="生理情绪套话堆叠",
+         pat=r"冷汗(?:浸透|涔涔|直冒|渗出)|心跳如(?:擂鼓|鼓)|瞳孔(?:骤缩|猛缩|微缩|地震)|"
+             r"喉头(?:发紧|滚动|一紧)|泛起[^，。！？\n]{0,6}铁锈味|雪松(?:味|气息)|寒意从(?:脚底|脊背)",
+         per_kilo=0.8, min_hits=2,
+         advice="AI 写情绪 81% 堆生理反应（人类 38%）。删去套话，换带身份惯性的反常小动作或直白命名情绪。",
+         src="sepia 配对实测；章法与手法 §二.1"),
+    dict(id="hollow_verb", tier="B", basis="editorial", name="虚化动宾壳子",
+         pat=r"实现了对[^，。！？\n]{1,14}的(?:突破|跨越|重构|升级|重塑)|"
+             r"完成了(?:从[^，。！？\n]{1,16}的)?(?:蜕变|跃迁|闭环|转身)|"
+             r"呈现出[^，。！？\n]{1,12}的(?:态势|格局|趋势|局面)|"
+             r"构成了对[^，。！？\n]{1,12}的(?:挑战|威胁|冲击)",
+         per_kilo=0.6, min_hits=2,
+         advice="剥掉虚化动词加抽象名词的塑料壳，换单双音节及物实词（如砍掉、卡住、撬开、缩到）。",
+         src="章法与手法 §一.3"),
 ]
 
-BANNED_CHARS = {"\u200b": "零宽空格", "\u200c": "零宽非连接符",
-                "\u200d": "零宽连接符", "\ufeff": "零宽不换行空格",
-                "\u2060": "词连接符"}
+_RULE_RE_CACHE = {}
+
+
+def compiled_rule(rule):
+    pat = rule["pat"]
+    cre = _RULE_RE_CACHE.get(pat)
+    if cre is None:
+        cre = re.compile(pat, re.MULTILINE)
+        _RULE_RE_CACHE[pat] = cre
+    return cre
+
+
+for _r in RULES:
+    compiled_rule(_r)
+
+BANNED_CHARS = {
+    "\u180e": "蒙古文元音分隔符",
+    "\u200b": "零宽空格",
+    "\u200c": "零宽非连接符",
+    "\u200d": "零宽连接符",
+    "\u200e": "左至右标记",
+    "\u200f": "右至左标记",
+    "\u202a": "左至右嵌入",
+    "\u202b": "右至左嵌入",
+    "\u202c": "方向格式弹出符",
+    "\u202d": "左至右覆盖",
+    "\u202e": "右至左覆盖",
+    "\u2060": "词连接符",
+    "\u2061": "隐形函数应用符",
+    "\u2062": "隐形乘号",
+    "\u2063": "隐形分隔符",
+    "\u2064": "隐形加号",
+    "\ufeff": "零宽不换行空格",
+}
 SENT_SPLIT = re.compile(r"(?<=[。！？；\n])")
-QUOTE = re.compile(r"「[^」]{0,400}」|“[^”]{0,400}”|\"[^\"]{0,400}\"|『[^』]{0,400}』")
+# 对抗防护：中文成对引号不跨空行吞段，ASCII 直引号不跨行，防止单处未闭合引号致盲全篇
+QUOTE = re.compile(
+    r"「(?:(?!\n[ \t]*\n)[^」]){0,2000}」"
+    r"|“(?:(?!\n[ \t]*\n)[^”]){0,2000}”"
+    r"|『(?:(?!\n[ \t]*\n)[^』]){0,2000}』"
+    r"|\"[^\"\n]{0,600}\""
+)
+_NON_NL_RE = re.compile(r"[^\n]")
+_MD_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n[\s\S]*?\n---[ \t]*(?=\n|$)")
+_MD_FENCE_RE = re.compile(r"\x60{3}[\s\S]*?\x60{3}|~{3}[\s\S]*?~{3}")
+_MD_INLINE_CODE_RE = re.compile(r"\x60[^\x60\n]{1,200}\x60")
+_MD_HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
+_MD_TABLE_ROW_RE = re.compile(r"(?m)^[ \t]*\|.*\|[ \t]*$")
+_MD_HR_LINE_RE = re.compile(r"(?m)^[ \t]*(?:---+|\*\*\*+|___+)[ \t]*$")
+_MD_HEADING_LINE_RE = re.compile(r"(?m)^[ \t]*#{1,6}[ \t]+[^\n]*$")
+_MD_LINK_TARGET_RE = re.compile(r"(\[[^\]\n]+\])(\((?:https?://|mailto:|file://|\.?\.?/|#)[^)\n]{1,400}\))")
+_MD_TRIGGER_CHARS = frozenset("#|`~<-]")
+
 ZERO_SUBJ_OK = re.compile(
     r"^(?:这|那|它|其|此|该|因此|所以|但|而|于是|结果|最终|后来|"
     r"值得|进一步|此外|同时|另外|首先|其次|再次|总之|换言之|"
-    r"从|在|对|关于|通过|由于|随着|就|至于|如果说|相比|相较于|按照|依据|针对)")
-# 谓词判定收紧：只看真正的判断句谓语。原来把「在」「有」也算进去，导致
-# 「代码在 GitHub 上开源了」这类有主语的正常句首被误判为零主语评论。
-PRED = re.compile(r"是|需要|应该|意味着|并非|就是|之所以")
+    r"从|对|关于|通过|由于|随着|就|至于|如果说|相比|相较于|按照|依据|针对)")
+ZERO_COMMENT_PAT = re.compile(
+    r"^(?:更|最|尤为|真正|同样|格外|尤其|特别)"
+    r"(?:重要|关键|核心|致命|可怕|可贵|讽刺|吊诡|棘手|麻烦|遗憾)"
+    r"的?(?:地方|问题|一点|之处)?(?:是|在于|莫过于)"
+    r"|^(?:不可否认|不可忽视|不容忽视|不容置疑|显而易见|毫无疑问|毋庸置疑|不言而喻|"
+    r"不得不承认|不得不说|需要指出|需要强调|需要警惕|值得警惕|令人担忧|耐人寻味|吊诡|讽刺|遗憾)"
+    r"(?:的是|[，、])"
+    r"|^(?:关键|要害|症结|难点|痛点|焦点|核心问题|问题)"
+    r"(?:还|就|恰恰|正)?(?:在于|莫过于)"
+)
+
+
+def _blank_match(m):
+    return _NON_NL_RE.sub("￭", m.group())
+
+
+def _blank_link_target(m):
+    return m.group(1) + _NON_NL_RE.sub("￭", m.group(2))
+
+
+def mask_md_for_rules(text):
+    """保换行等长遮罩块级非正文结构与链接 URL（保留锚文本与 # 标题供 heading_echo 检查）。"""
+    if not any(ch in text for ch in _MD_TRIGGER_CHARS):
+        return text
+    out = _MD_FRONTMATTER_RE.sub(_blank_match, text)
+    out = _MD_FENCE_RE.sub(_blank_match, out)
+    out = _MD_HTML_COMMENT_RE.sub(_blank_match, out)
+    out = _MD_TABLE_ROW_RE.sub(_blank_match, out)
+    out = _MD_HR_LINE_RE.sub(_blank_match, out)
+    if "](" in out:
+        out = _MD_LINK_TARGET_RE.sub(_blank_link_target, out)
+    return out
+
+
+def strip_md_for_structure(text):
+    """保换行遮罩全部非正文结构块（含 # 小标题），防止表格、代码与标题污染段落同构与文风统计。"""
+    if not any(ch in text for ch in _MD_TRIGGER_CHARS):
+        return text
+    out = mask_md_for_rules(text)
+    return _MD_HEADING_LINE_RE.sub(_blank_match, out)
+
+
+def build_line_index(text):
+    """构建 0-based 行首字符偏移索引，供 O(log N) 反查 1-based 行号。"""
+    starts = [0]
+    pos = text.find("\n")
+    while pos != -1:
+        starts.append(pos + 1)
+        pos = text.find("\n", pos + 1)
+    return starts
+
+
+def offset_to_line(line_starts, offset):
+    return bisect.bisect_right(line_starts, max(offset, 0))
+
+
+def offset_span_to_lines(text, offset, length, line_starts=None):
+    """把 (字符偏移, 长度) 映射为 1-based 闭区间 (起始行, 结束行)。"""
+    ls = line_starts if line_starts is not None else build_line_index(text)
+    end_off = max(offset, offset + max(length, 1) - 1)
+    # 跳过段尾空白换行，避免结束行虚跨到下一空行
+    while end_off > offset and end_off < len(text) and text[end_off] in ("\n", "\r", " ", "\t"):
+        end_off -= 1
+    return offset_to_line(ls, offset), offset_to_line(ls, end_off)
+
+
+def _context_snippet(text, start, end, radius=16):
+    ln_s = text.rfind("\n", 0, start)
+    ln_s = 0 if ln_s == -1 else ln_s + 1
+    ln_e = text.find("\n", end)
+    ln_e = len(text) if ln_e == -1 else ln_e
+    s = max(ln_s, start - radius)
+    e = min(ln_e, end + radius)
+    prefix = "…" if s > ln_s else ""
+    suffix = "…" if e < ln_e else ""
+    frag = text[s:e].replace("\n", " ").strip()
+    if len(frag) > 44:
+        frag = frag[:44] + "…"
+    return prefix + frag + suffix
 
 
 def split_sents(t):
-    return [s.strip() for s in SENT_SPLIT.split(t) if s.strip()]
+    clean = t.replace("￭", "") if "￭" in t else t
+    return [s.strip() for s in SENT_SPLIT.split(clean) if s.strip()]
+
+
+def split_paras_with_lines(struct_text):
+    """返回 [(1-based行号, 干净正文段), ...]，自动跳过被遮罩的表格、代码块、标题与空行。"""
+    out = []
+    for ln_no, raw_ln in enumerate(struct_text.splitlines(), 1):
+        clean = raw_ln.replace("￭", "").strip() if "￭" in raw_ln else raw_ln.strip()
+        if clean:
+            out.append((ln_no, clean))
+    return out
 
 
 def split_paras(t):
-    return [p.strip() for p in re.split(r"\n\s*\n|\n", t) if p.strip()]
+    return [p for _, p in split_paras_with_lines(strip_md_for_structure(t))]
+
+
+def extract_outline(text):
+    """抽取全文正文段的首句大纲与中段三分之一区间（供 QUD 语篇骨架体检）。"""
+    para_rows = split_paras_with_lines(strip_md_for_structure(text))
+    n = len(para_rows)
+    lo = (n // 3) + 1 if n >= 3 else 1
+    hi = n - (n // 3) if n >= 3 else n
+    items = []
+    for idx, (ln_no, p) in enumerate(para_rows, 1):
+        ps = split_sents(p)
+        head = ps[0] if ps else p
+        if len(head) > 48:
+            head = head[:48] + "…"
+        items.append({
+            "para": idx,
+            "line": ln_no,
+            "chars": len(p),
+            "in_mid_third": (lo <= idx <= hi) if n >= 3 else False,
+            "head": head,
+        })
+    return {"total_paras": n, "mid_range": [lo, hi] if n >= 3 else [], "items": items}
 
 
 def cv(v):
@@ -211,7 +436,7 @@ def mtld(tokens, threshold=0.72, min_len=10):
         for tok in seq:
             n += 1
             types.add(tok)
-            if len(types) / n <= threshold:
+            if len(types) <= n * threshold:
                 n_f += 1
                 types, n = set(), 0
         if n:
@@ -219,14 +444,16 @@ def mtld(tokens, threshold=0.72, min_len=10):
             n_f += (1 - partial) / (1 - threshold) if partial < 1 else 0
         return n_f
 
-    d = f(tokens) + f(list(reversed(tokens)))
+    d = f(tokens) + f(tokens[::-1])
     return len(tokens) / (d / 2) if d else None
 
 
 def mask(text, whitelist):
-    """把引号内容与白名单词替换为等长占位符，保持偏移不变。"""
-    blank = lambda s: re.sub(r"[^\n]", "￭", s)
-    out = QUOTE.sub(lambda m: blank(m.group()), text)
+    """把 Markdown 非正文块、行内代码、引号内容与白名单词替换为等长占位符，严格保持字符偏移与行号不变。"""
+    md_masked = mask_md_for_rules(text)
+    if "`" in md_masked:
+        md_masked = _MD_INLINE_CODE_RE.sub(_blank_match, md_masked)
+    out = QUOTE.sub(_blank_match, md_masked)
     for w in whitelist:
         if w:
             out = out.replace(w, "￭" * len(w))
@@ -247,10 +474,15 @@ def _personal_limit(rule, profile):
 
 
 def load_profile(path=None):
-    p = path or os.path.join(os.path.expanduser("~"), ".workbuddy",
-                             "writing-loop", "profiles", "self.json")
+    default_dir = os.environ.get("WRITING_LOOP_HOME") or os.path.join(
+        os.path.expanduser("~"), ".writing-loop", "profiles")
+    p = path or os.path.join(default_dir, "self.json")
     if not os.path.isfile(p):
-        return None
+        legacy = os.path.join(os.path.expanduser("~"), ".workbuddy", "writing-loop", "profiles", "self.json")
+        if os.path.isfile(legacy):
+            p = legacy
+        else:
+            return None
     try:
         with open(p, encoding="utf-8") as f:
             return json.load(f)
@@ -259,26 +491,50 @@ def load_profile(path=None):
 
 
 def scan(text, samples=3, whitelist=None, profile=None):
-    whitelist = [w.strip() for w in (whitelist or []) if w.strip()]
+    whitelist = [w.strip() for w in (whitelist or []) if w.strip() and not w.strip().startswith("#")]
     if profile:
         whitelist += [w for w in profile.get("whitelist", []) if w not in whitelist]
-    chars = len(text)
+
+    md_rule_clean = mask_md_for_rules(text)
+    struct_clean = strip_md_for_structure(text)
+    prose_only = struct_clean.replace("￭", "")
+    chars = len(prose_only.strip()) or len(text)
     kilo = max(chars / 1000.0, 0.001)
     short = chars < SHORT_TEXT
-    masked = mask(text, whitelist)
+    rule_base = _MD_INLINE_CODE_RE.sub(_blank_match, md_rule_clean) if "`" in md_rule_clean else md_rule_clean
+    masked = QUOTE.sub(_blank_match, rule_base)
+    for w in whitelist:
+        if w:
+            masked = masked.replace(w, "￭" * len(w))
+
+    line_starts = build_line_index(text)
     issues = []
 
-    bad = [n for c, n in BANNED_CHARS.items() if c in text]
-    if bad:
+    bad_locs = []
+    bad_names = set()
+    bad_total = 0
+    for ch, cname in BANNED_CHARS.items():
+        pos = text.find(ch)
+        while pos != -1:
+            bad_total += 1
+            bad_names.add(cname)
+            if len(bad_locs) < samples:
+                ln = offset_to_line(line_starts, pos)
+                bad_locs.append({"line": ln, "match": cname, "snippet": _context_snippet(text, pos, pos + 1)})
+            pos = text.find(ch, pos + 1)
+    if bad_names:
         issues.append(dict(id="zero_width", tier="X", basis="editorial",
-                           name="检出零宽字符", hits=1,
-                           detail="、".join(sorted(set(bad))),
-                           advice="立即删除。字符级作弊，编码转换即暴露。",
-                           src="RAID homoglyph 攻击一类"))
+                           name="检出零宽或隐形字符", hits=bad_total,
+                           detail="、".join(sorted(bad_names)),
+                           locations=bad_locs,
+                           sample=["[行%d] %s" % (loc["line"], loc["snippet"]) for loc in bad_locs],
+                           advice="立即删除。字符级作弊或方向控制符污染，编码转换即暴露。",
+                           src="RAID homoglyph / Trojan Source 攻击一类"))
 
     for r in RULES:
-        hits = [m.group() for m in re.finditer(r["pat"], masked, flags=re.MULTILINE)]
-        n = len(hits)
+        cre = compiled_rule(r)
+        matches = list(cre.finditer(masked))
+        n = len(matches)
         if not n:
             continue
         rate, source = _personal_limit(r, profile)
@@ -290,6 +546,11 @@ def scan(text, samples=3, whitelist=None, profile=None):
                 continue
         elif not by_density:
             continue
+        locs = []
+        for m in matches[:samples]:
+            ln = offset_to_line(line_starts, m.start())
+            snip = _context_snippet(text, m.start(), m.end())
+            locs.append({"line": ln, "match": m.group(), "snippet": snip})
         issues.append(dict(id=r["id"], tier=r["tier"], basis=r["basis"], name=r["name"],
                            hits=n,
                            limit=("0 处" if rate == 0 else
@@ -298,30 +559,44 @@ def scan(text, samples=3, whitelist=None, profile=None):
                                      "，个人基线" if source == "个人" else "",
                                      r["min_hits"])),
                            baseline=source,
-                           sample=hits[:samples], advice=r["advice"], src=r["src"]))
+                           locations=locs,
+                           sample=["[行%d] %s" % (loc["line"], loc["snippet"]) for loc in locs],
+                           advice=r["advice"], src=r["src"]))
 
-    sents = split_sents(text)
+    para_rows = split_paras_with_lines(struct_clean)
+    paras = [p for _, p in para_rows]
+    sents = split_sents(prose_only)
     slen = [len(s) for s in sents]
-    paras = split_paras(text)
-    nonfirst = paras[1:]
+    nonfirst = para_rows[1:]
 
     iso2 = iso3 = 0
-    for p in paras:
+    iso2_locs, iso3_locs = [], []
+    for ln_no, p in para_rows:
         ps = split_sents(p)
         run = 1
+        p_iso2 = p_iso3 = False
         for i in range(1, len(ps)):
             if abs(len(ps[i]) - len(ps[i - 1])) <= 2:
                 run += 1
             else:
                 if run == 2:
                     iso2 += 1
+                    p_iso2 = True
                 elif run >= 3:
                     iso3 += 1
+                    p_iso3 = True
                 run = 1
         if run == 2:
             iso2 += 1
+            p_iso2 = True
         elif run >= 3:
             iso3 += 1
+            p_iso3 = True
+        p_snip = (p[:42] + "…") if len(p) > 42 else p
+        if p_iso2 and len(iso2_locs) < samples:
+            iso2_locs.append({"line": ln_no, "snippet": p_snip})
+        if p_iso3 and len(iso3_locs) < samples:
+            iso3_locs.append({"line": ln_no, "snippet": p_snip})
 
     if len(paras) >= 10:
         r2 = iso2 / len(paras) * 100
@@ -330,40 +605,51 @@ def scan(text, samples=3, whitelist=None, profile=None):
             issues.append(dict(id="iso2", tier="A", basis="paired", name="连续两句同构",
                                hits=iso2, limit="≤ %.1f 处/百段" % TH_PARA_ISO2,
                                detail="%.1f 处/百段（人类 4.81 / AI 9.41）" % r2,
+                               locations=iso2_locs,
+                               sample=["[行%d] %s" % (x["line"], x["snippet"]) for x in iso2_locs],
                                advice="合并相邻两句，或改其中一句的句式，不要只换词。",
                                src="lieflat 配对 1.96×"))
         if r3 > TH_PARA_ISO3:
             issues.append(dict(id="iso3", tier="A", basis="paired", name="连续三句同构",
                                hits=iso3, limit="≤ %.1f 处/百段" % TH_PARA_ISO3,
                                detail="%.1f 处/百段（人类 0.41 / AI 0.84）" % r3,
+                               locations=iso3_locs,
+                               sample=["[行%d] %s" % (x["line"], x["snippet"]) for x in iso3_locs],
                                advice="三连同构是最硬的段落级信号，整段重排。",
                                src="lieflat 配对 2.03×"))
 
     zs = 0
-    for p in nonfirst:
+    zs_locs = []
+    for ln_no, p in nonfirst:
         ps = split_sents(p)
         if not ps:
             continue
         head = ps[0]
-        if (len(head) >= 6 and not ZERO_SUBJ_OK.match(head)
-                and "在" not in head and PRED.search(head)):
+        if len(head) >= 6 and not ZERO_SUBJ_OK.match(head) and ZERO_COMMENT_PAT.search(head):
             zs += 1
+            if len(zs_locs) < samples:
+                h_snip = (head[:42] + "…") if len(head) > 42 else head
+                zs_locs.append({"line": ln_no, "snippet": h_snip})
     if len(nonfirst) >= 5:
         zr = zs / len(nonfirst) * 100
         if zr > TH_ZERO_SUBJ:
             issues.append(dict(id="zero_subj", tier="A", basis="paired", name="段首零主语评论",
                                hits=zs, limit="≤ %.2f%%" % TH_ZERO_SUBJ,
                                detail="%.2f%% 的非首段以无回指的评论句开头（人类 0.14 / AI 0.61）" % zr,
+                               locations=zs_locs,
+                               sample=["[行%d] %s" % (x["line"], x["snippet"]) for x in zs_locs],
                                advice="补一个「这」或「那」把回指接上，或删掉这句评论。",
                                src="lieflat 配对 4.38×，最稳的段落级信号"))
 
-    metrics = dict(chars=chars, sentences=len(sents), paragraphs=len(paras),
+    prose_no_quote = QUOTE.sub("", prose_only)
+    metrics = dict(chars=chars, raw_chars=len(text), sentences=len(sents), paragraphs=len(paras),
                    sent_mean=round(statistics.mean(slen), 1) if slen else None,
                    sent_cv=round(cv(slen), 3) if cv(slen) else None,
-                   first_person=len(re.findall(r"我|咱们", text)),
-                   masked_quotes=len(QUOTE.findall(text)),
+                   first_person=len(re.findall(r"我|咱们", prose_no_quote)),
+                   masked_quotes=len(QUOTE.findall(md_rule_clean)),
                    whitelist_hits=len(whitelist))
-    m = mtld(re.findall(r"[一-龥]", text))
+    han_chars = [ch for ch in prose_only if "\u4e00" <= ch <= "\u9fa5"]
+    m = mtld(han_chars)
     if m:
         metrics["mtld"] = round(m, 1)
 
@@ -378,9 +664,21 @@ NOTE = ("以下指标配对实测与人类无差异或方向相反，本扫描�
         "问句小标题、案例凑三个、标点密度、段落平均长度。依据见各规则的 src 字段。")
 
 
-def render(res):
+def render_outline(outline):
+    L = ["【首句大纲与中段体检】（共 %d 正文段%s）"
+         % (outline["total_paras"],
+            ("，★ 标示中段三分之一区间：第 %d–%d 段" % tuple(outline["mid_range"]))
+            if outline["mid_range"] else "")]
+    for it in outline["items"]:
+        mark = "★" if it["in_mid_third"] else " "
+        L.append(" %s[段%d:行%d] (%d字) %s"
+                 % (mark, it["para"], it["line"], it["chars"], it["head"]))
+    return "\n".join(L)
+
+
+def render(res, outline=None):
     m, iss = res["metrics"], res["issues"]
-    L = ["字数 %d ｜ 句 %d ｜ 段 %d ｜ 引号豁免 %d 段 ｜ 白名单 %d 词"
+    L = ["正文字数 %d ｜ 句 %d ｜ 正文段 %d ｜ 引号豁免 %d 段 ｜ 白名单 %d 词"
          % (m["chars"], m["sentences"], m["paragraphs"],
             m["masked_quotes"], m["whitelist_hits"]),
          "句长均值 %s ｜ 变异系数 %s（仅参考）｜ 第一人称 %d 处"
@@ -402,8 +700,10 @@ def render(res):
             if it.get("detail"):
                 L.append("      " + it["detail"])
             if it.get("sample"):
-                L.append("      例：%s" % " ；".join(str(s)[:30] for s in it["sample"]))
+                L.append("      定位：%s" % " ；".join(str(s)[:58] for s in it["sample"]))
             L.append("      改法：%s" % it["advice"])
+    if outline is not None:
+        L += ["", render_outline(outline)]
     L += ["", "说明：" + res["note"]]
     return "\n".join(L)
 
@@ -413,15 +713,16 @@ def main():
     ap.add_argument("file", nargs="?")
     ap.add_argument("--text", default=None)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--outline", action="store_true", help="附加输出各正文段的首句大纲与中段区间")
     ap.add_argument("--whitelist", default=None, help="白名单文件，一行一个词，命中不计")
     ap.add_argument("--samples", type=int, default=3)
-    ap.add_argument("--profile", default=None, help="文风画像 JSON，缺省读 ~/.workbuddy/writing-loop/profiles/self.json")
+    ap.add_argument("--profile", default=None, help="文风画像 JSON，缺省读 ~/.writing-loop/profiles/self.json")
     ap.add_argument("--no-profile", action="store_true", help="忽略个人画像，只用通用阈值")
     a = ap.parse_args()
-    if a.text:
-        text = a.text
+    if a.text is not None:
+        text = a.text.lstrip("\ufeff")
     elif a.file and os.path.isfile(a.file):
-        text = open(a.file, encoding="utf-8").read()
+        text = read_text(a.file)
     else:
         ap.error("需要文件路径或 --text")
     if not text.strip():
@@ -432,12 +733,15 @@ def main():
         if not os.path.isfile(a.whitelist):
             sys.stderr.write("白名单文件不存在：%s\n" % a.whitelist)
             sys.exit(2)
-        wl = open(a.whitelist, encoding="utf-8").read().splitlines()
+        wl = read_text(a.whitelist).splitlines()
     prof = None if a.no_profile else load_profile(a.profile)
     res = scan(text, a.samples, wl, prof)
     res["profile_used"] = bool(prof)
+    ol = extract_outline(text) if a.outline else None
+    if ol is not None:
+        res["outline"] = ol
     sys.stdout.write(json.dumps(res, ensure_ascii=False, indent=2) + "\n"
-                     if a.json else render(res) + "\n")
+                     if a.json else render(res, outline=ol) + "\n")
 
 
 if __name__ == "__main__":

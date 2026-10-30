@@ -1,52 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""writing-loop 文风画像：按作者归属学的成熟方法建立个人基线。
+# Copyright (C) 2026 faruheaisha
+# SPDX-License-Identifier: GPL-3.0-only
+"""writing-loop 文风画像（v2.2：整句窗口滚动 Delta + 单遍向量化 + 全命令 .docx 与 JSON 支持）
 
 方法出处（新近为主，经典方法仅作底座）
   The Width of a Voice: Placing Machine Imitation Inside Authors' Own Variation,
     Zenodo preprint v0.5.5, 2026-07（投 CHR 2027）。在 15 位已出版小说家上按 Burrows
     Delta 建立逐作者、按长度匹配的组内变异包络；留出自身文本回落包络率 84% 至 88%，
-    作为正对照。给出作者原文片段优于只给作者名。并测出十二项「AI 特征」组合检测器
-    在人机判别上 AUC 0.506，等于抛硬币。
+    作为正对照。给出作者原文片段优于只给作者名。
   StyloPrompt, AIED 2026（arXiv 收录）：把文体指纹转成自然语言描述比直接给数值更
     有效，NL-Distribution 编码在跨风格迁移上达 89% 成功率。本文件的 descriptor 照此。
   PersonalBench, 2026：推理时个性化能把输出调节到可区分（AUC 0.918），但跨不过
     人机边界；所有方法与真实作者的相似度 0.484 至 0.508，低于人类之间 0.626 至
     0.756。故本文件从不声称能让人写出「像你」的稿子，只报距离。
   Burrows 2002, Delta: A Measure of Stylistic Difference and a Guide to Likely
-    Authorship, Literary and Linguistic Computing. 取 n 个最高频特征、z-score
-    标准化、算平均绝对差。
-  Jannidis et al. 2015 与 Smith & Aldridge 2011 报告 Cosine 变体在大 N 与
-    长文本下更优。本机实测（8 篇同作者、单篇约 190 字、159 维）两种距离：
-    经典 Manhattan 组内均值 0.498（0.253 至 0.645），Cosine 组内均值 1.141
-    （0.544 至 1.459）。短文本稀疏特征下 Cosine 已接近正交，故采用经典
-    Manhattan。这是一次带数字的取舍，不是默认选择。
-  法证文本比对实践：功能词是最具判别力的特征（content-independent，
-  不受题材影响），N 取 260 时与文档长度无关。本文件取约 160 个中文功能词
-  与标点，加句长分箱。
-  Rolling Delta：把 Delta 施于滑动窗，得到全文的风格漂移曲线，用于定位
-  哪一段偏离作者本人最远。
-  Liu et al. 2021, What Makes Good In-Context Examples for GPT-3（KATE）：
-  按余弦相似度取最近的 k 个样例作上下文示例，优于随机抽样。
-
-做了什么
-  build   从作者旧稿建画像：特征均值方差、作者自己的 Delta 分布、锚点文档
-  drift   对一篇新稿做滚动 Delta，定位最不像作者本人的段落
-  exemplar 按 KATE 取与指定段落最相近的作者旧稿片段，供 few-shot 使用
-  check   综合报告：Delta 与百分位、各特征偏离
-  show / reset
-
-存储 ~/.workbuddy/writing-loop/profiles/<名字>.json（技能目录之外，重装不丢）
+    Authorship, Literary and Linguistic Computing.
+  Jannidis et al. 2015 / Smith & Aldridge 2011：本机短文本稀疏特征实测经典 Manhattan
+    优于 Cosine，故采用经典 Manhattan。
+  Liu et al. 2021（KATE）：按最近距离取 k 个样例作上下文示例，优于随机抽样。
 
 用法
-  python profile.py build 旧稿目录/ [--append]
-  python profile.py drift 新稿.txt
-  python profile.py exemplar 新稿.txt --k 3
-  python profile.py check 新稿.txt
+  python style_profile.py build 旧稿目录/ [--append]
+  python style_profile.py drift 新稿.docx
+  python style_profile.py exemplar 新稿.md --k 3
+  python style_profile.py check 新稿.docx
 """
 import argparse
 import glob
-import io
 import json
 import math
 import os
@@ -55,86 +36,115 @@ import statistics
 import sys
 from datetime import datetime
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import scan as scanner  # noqa: E402
 
-ROOT = os.path.join(os.path.expanduser("~"), ".workbuddy", "writing-loop", "profiles")
+ROOT = os.environ.get("WRITING_LOOP_HOME") or os.path.join(
+    os.path.expanduser("~"), ".writing-loop", "profiles")
 STORE = os.path.join(ROOT, "self.json")
+
+DECAY = 0.85
+TEXT_EXT = scanner.TEXT_EXT
+DOCX_EXT = scanner.DOCX_EXT
+read_docx = scanner.read_docx
+
+MIN_DOC_CHARS = 150
+MAX_DOC_CHARS = 12000
+N_FEATURES = 260
 
 
 def store_for(name):
+    root = os.environ.get("WRITING_LOOP_HOME") or ROOT
     safe = re.sub(r"[^\w\u4e00-\u9fff-]", "_", name)[:40] or "self"
-    return os.path.join(ROOT, safe + ".json")
-DECAY = 0.85
-TEXT_EXT = (".md", ".txt", ".markdown")
-DOCX_EXT = (".docx",)
+    return os.path.join(root, safe + ".json")
 
 
-def read_docx(path):
-    """从 docx 提取正文：解包 zip，取 word/document.xml，剥标签，段落转行。"""
-    import zipfile
-    with zipfile.ZipFile(path) as z:
-        xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
-    xml = re.sub(r"</w:p>", "\n", xml)
-    txt = re.sub(r"<[^>]+>", "", xml)
-    return re.sub(r"\n{3,}", "\n\n", txt)
-MIN_DOC_CHARS = 150          # 低于此长度的单篇不参与建模
-MAX_DOC_CHARS = 12000     # 超长稿截断，避免单篇压死分布
-N_FEATURES = 260          # 法证实践给出的大小，与文档长度无关
+# 中文功能词：严格剔除易与实词词素混淆的题材单字（如人、一、上、中、下、对、要、会、说、发等）
+FUNC = """因为 所以 如果 虽然 即使 只是 已经 还是 还有 一些 怎么 为什么 时候 我们 他们
+可以 应该 需要 能够 进行 通过 根据 以及 并且 而且 因此 但是 然而 不过 就是 一直 总是
+常常 可能 大概 也许 其实 比较 里面 外面 上面 下面 前面 后面 之间 之后 之前 当时 现在
+原来 本来 确实 显然 当然 一般 通常 往往 有时 有些 很多 不少 一点 完全 非常 特别 十分
+相当 稍微 几乎 至少 的 了 着 过 吗 呢 吧 啊 却 则 若 虽 既 越 更 最 太 又 再 才 仅
+都 也 还 把 被 让 给 从 向 其 之"""
 
-# 中文功能词：代词、介词、连词、助词、副词、常用虚化动词。不带题材色彩。
-FUNC = """的 了 在 是 和 有 就 不 人 都 一 上 也 很 到 说 要 去 你 会 着 没 看 好 自己
-这 那 我 他 她 它 们 个 中 对 与 及 或 但 而 因为 所以 如果 虽然 即使 只是 已经 还是
-还有 一些 什么 怎么 为什么 时候 问题 方法 我们 他们 可以 应该 需要 能够 进行 通过
-根据 以及 并且 而且 因此 但是 然而 不过 就是 一直 总是 常常 可能 大概 也许 其实
-比较 更 最 太 又 再 才 只 都 还 并 却 则 若 因 故 由 于 以 为 被 把 给 让 使 从 向
-里面 外面 上面 下面 前面 后面 之间 之后 之前 当时 现在 原来 本来 确实 显然 当然
-一般 通常 往往 有时 有些 很多 不少 一点 完全 非常 特别 十分 相当 稍微 几乎 至少"""
-
-PUNCT = "，。、；：？！——…（）「」《》"
+PUNCT_ITEMS = ["，", "。", "、", "；", "：", "？", "！", "——", "…", "（", "）", "“", "”", "「", "」", "《", "》"]
 
 SL_BINS = [(0, 10), (11, 20), (21, 35), (36, 60), (61, 10 ** 6)]
 
 
 def feature_names():
-    fw = []
+    out = []
     seen = set()
     for w in FUNC.split():
-        if w not in seen:
-            seen.add(w)
-            fw.append("fw:" + w)
-    pw = ["p:" + p for p in PUNCT]
-    sl = ["sl:%d-%d" % (a, b if b < 10 ** 6 else 999) for a, b in SL_BINS]
-    return (fw + pw + sl)[:N_FEATURES]
+        tag = "fw:" + w
+        if tag not in seen:
+            seen.add(tag)
+            out.append(tag)
+    for p in PUNCT_ITEMS:
+        tag = "p:" + p
+        if tag not in seen:
+            seen.add(tag)
+            out.append(tag)
+    for a, b in SL_BINS:
+        tag = "sl:%d-%d" % (a, b if b < 10 ** 6 else 999)
+        if tag not in seen:
+            seen.add(tag)
+            out.append(tag)
+    return out[:N_FEATURES]
 
 
 FEATS = feature_names()
+# 模块加载期预排功能词长度并解析特征规格，消除每次 vector() 重复排序与五次切句开销
+_FW_KEYS_SORTED = sorted([f[3:] for f in FEATS if f.startswith("fw:")], key=lambda x: -len(x))
+_FEAT_SPECS = []
+for _fn in FEATS:
+    _kind, _key = _fn.split(":", 1)
+    if _kind == "sl":
+        _lo, _hi = [int(x) for x in _key.split("-")]
+        _FEAT_SPECS.append((_kind, (_lo, _hi)))
+    else:
+        _FEAT_SPECS.append((_kind, _key))
 
 
 def vector(text):
-    """相对频率向量。长度按字数归一。"""
-    n = max(len(text), 1)
+    """相对频率向量：先剥离 Markdown 非正文块，再按长词优先遮罩统计功能词，单次切句分箱，按正文字数归一。"""
+    clean = scanner.strip_md_for_structure(text)
+    if "￭" in clean:
+        clean = clean.replace("￭", "")
+    if not clean.strip():
+        clean = text
+    n = max(len(clean), 1)
+
+    fw_counts = {}
+    buf = clean
+    for k in _FW_KEYS_SORTED:
+        c = buf.count(k)
+        fw_counts[k] = c
+        if len(k) > 1 and c > 0:
+            buf = buf.replace(k, "\ufffd" * len(k))
+
+    slens = [len(s) for s in scanner.split_sents(clean)]
     v = []
-    for name in FEATS:
-        kind, key = name.split(":", 1)
+    for kind, key in _FEAT_SPECS:
         if kind == "fw":
-            c = text.count(key)
+            c = fw_counts.get(key, 0)
         elif kind == "p":
-            c = text.count(key)
+            c = clean.count(key)
         else:
-            lo, hi = [int(x) for x in key.split("-")]
-            c = sum(1 for s in scanner.split_sents(text) if lo <= len(s) <= hi)
+            lo, hi = key
+            c = sum(1 for sl in slens if lo <= sl <= hi)
         v.append(c / n * 1000.0)
     return v
 
 
-Z_CAP = 4.0   # z 截断：作者从未用过的特征不能因 sd 极小把距离炸到百万级
+Z_CAP = 4.0
 
 
 def zscore(vec, mu, sd):
@@ -157,7 +167,6 @@ def cos_dist(a, b):
 
 
 def mean_abs_dev(a, b):
-    """经典 Burrows Delta：z 分数之差的平均绝对值。本文件的主距离。"""
     return sum(abs(x - y) for x, y in zip(a, b)) / max(len(a), 1)
 
 
@@ -165,9 +174,29 @@ def delta(a, b):
     return mean_abs_dev(a, b)
 
 
+def _clean_excerpt(text, max_chars=260):
+    """跳过 Markdown 非正文块与标题行，按完整句末标点截取干净的原文片段供 few-shot 使用。"""
+    struct = scanner.strip_md_for_structure(text)
+    lines = [ln.replace("￭", "").strip() for ln in struct.splitlines()
+             if ln.replace("￭", "").strip()]
+    body = "\n".join(lines).strip() or text.strip()
+    if len(body) <= max_chars:
+        return body
+    cut = body[:max_chars]
+    last_end = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("\n"))
+    if last_end >= 80:
+        return cut[:last_end + 1].strip()
+    return cut.strip()
+
+
 def load(store=STORE):
     if not os.path.isfile(store):
-        return None
+        legacy = os.path.join(os.path.expanduser("~"), ".workbuddy", "writing-loop",
+                              "profiles", os.path.basename(store))
+        if os.path.isfile(legacy):
+            store = legacy
+        else:
+            return None
     try:
         with open(store, encoding="utf-8") as f:
             return json.load(f)
@@ -189,9 +218,7 @@ def collect(paths):
         if os.path.isdir(p):
             for ext in TEXT_EXT + DOCX_EXT:
                 files += glob.glob(os.path.join(p, "**", "*" + ext), recursive=True)
-        elif os.path.isfile(p) and p.lower().endswith(TEXT_EXT):
-            files.append(p)
-        elif os.path.isfile(p) and p.lower().endswith(DOCX_EXT):
+        elif os.path.isfile(p) and p.lower().endswith(TEXT_EXT + DOCX_EXT):
             files.append(p)
     return sorted(set(files))
 
@@ -199,7 +226,7 @@ def collect(paths):
 def build(paths, append=False, store=STORE, min_chars=None):
     files = collect(paths)
     if not files:
-        sys.stderr.write("没有找到 .md 或 .txt 稿件\n")
+        sys.stderr.write("没有找到 .md、.txt 或 .docx 稿件\n")
         return 2
     old = load(store) if append else None
     seen = set((old or {}).get("files", {}))
@@ -211,10 +238,7 @@ def build(paths, append=False, store=STORE, min_chars=None):
     docs = []
     for f in todo:
         try:
-            if f.lower().endswith(DOCX_EXT):
-                t = read_docx(f)[:MAX_DOC_CHARS]
-            else:
-                t = open(f, encoding="utf-8").read()[:MAX_DOC_CHARS]
+            t = scanner.read_text(f)[:MAX_DOC_CHARS]
         except Exception as e:
             sys.stderr.write("跳过 %s：%s\n" % (f, e))
             continue
@@ -222,8 +246,15 @@ def build(paths, append=False, store=STORE, min_chars=None):
             continue
         docs.append((os.path.abspath(f), t, vector(t)))
     if not docs:
-        lens = sorted((len(open(f, encoding="utf-8").read().strip()) for f in todo
-                       if os.path.isfile(f)), reverse=True)[:5]
+        lens = []
+        for f in todo:
+            if not os.path.isfile(f):
+                continue
+            try:
+                lens.append(len(scanner.read_text(f).strip()))
+            except Exception:
+                pass
+        lens = sorted(lens, reverse=True)[:5]
         sys.stderr.write(
             "所有稿件都短于 %d 字，无法建模。文体距离需要足够长的样本。\n"
             "  你给的最长几篇：%s 字\n"
@@ -231,22 +262,25 @@ def build(paths, append=False, store=STORE, min_chars=None):
             % (min_chars or MIN_DOC_CHARS, lens or ["?"]))
         return 2
 
-    # 均值方差：新增样本与旧画像按衰减权重合并
+    # 均值方差：新增样本与旧画像按衰减权重合并（平行轴定理补齐组间均值差平方项）
     n_new = len(docs)
     n_old = (old or {}).get("n", 0) * DECAY
     mu_new = [statistics.mean(d[2][i] for d in docs) for i in range(len(FEATS))]
     sd_new = [statistics.pstdev([d[2][i] for d in docs]) if n_new > 1 else 0.0
               for i in range(len(FEATS))]
-    if old and old.get("mu"):
+    if old and old.get("mu") and len(old["mu"]) == len(FEATS):
         w = n_old + n_new
         mu = [(o * n_old + n_ * n_new) / w for o, n_ in zip(old["mu"], mu_new)]
-        sd = [math.sqrt((o ** 2 * n_old + s ** 2 * n_new) / w)
-              for o, s in zip(old.get("sd", sd_new), sd_new)]
+        sd = []
+        for o_mu, n_mu, c_mu, o_sd, n_sd in zip(old["mu"], mu_new, mu, old.get("sd", sd_new), sd_new):
+            v_old = (o_sd ** 2) + (o_mu - c_mu) ** 2
+            v_new = (n_sd ** 2) + (n_mu - c_mu) ** 2
+            combined_var = (v_old * n_old + v_new * n_new) / max(w, 1e-6)
+            sd.append(math.sqrt(max(combined_var, 0.0)))
     else:
         mu, sd = mu_new, sd_new
     sd = [s if s > 1e-6 else 1e-6 for s in sd]
 
-    # 作者自己的 Delta 分布：留一法
     zv = [zscore(d[2], mu, sd) for d in docs]
     within = []
     for i in range(len(zv)):
@@ -263,22 +297,25 @@ def build(paths, append=False, store=STORE, min_chars=None):
         within_mean = statistics.mean(within) if within else 0.0
         within_max = max(within) if within else 0.0
 
-    # 锚点：保留若干篇的 z 向量与片段，供 Rolling Delta 与 KATE 检索
     anchors = list((old or {}).get("anchors", []))
+    new_anchor_objs = []
     for f, t, v in docs:
-        anchors.append({
+        a_obj = {
             "src": os.path.basename(f),
             "chars": len(t),
             "z": [round(x, 3) for x in zscore(v, mu, sd)],
-            "text": t[:180],
-        })
+            "text": _clean_excerpt(t, 260),
+        }
+        anchors.append(a_obj)
+        new_anchor_objs.append(a_obj)
     anchors = anchors[-40:]
 
-    # 逐规则频次基线：供 scan.py 校准阈值，与 Delta 正交
+    # 逐规则频次基线：先行遮罩引号内他人引文与 Markdown 非正文块，避免引语污染作者个人习惯
+    masked_docs = [(scanner.mask(d[1], []), max(len(d[1]) / 1000.0, 0.001)) for d in docs]
     rules = {}
     for r in scanner.RULES:
-        vals = [len(re.findall(r["pat"], d[1], flags=re.MULTILINE)) / max(len(d[1]) / 1000.0, 0.001)
-                for d in docs]
+        cre = scanner.compiled_rule(r)
+        vals = [len(cre.findall(m_txt)) / kilo_d for m_txt, kilo_d in masked_docs]
         m_new = statistics.mean(vals) if vals else 0.0
         p_new = sorted(vals)[min(len(vals) - 1, int(round(len(vals) * 0.95)) - 1)] if len(vals) > 1 else m_new
         o = ((old or {}).get("rules") or {}).get(r["id"])
@@ -296,22 +333,34 @@ def build(paths, append=False, store=STORE, min_chars=None):
     for f, t, _ in docs:
         files_map[f] = len(t)
 
-    # 正对照：作者自己的留出文本能否回落自己的包络
-    def _entry(vec, length, pool, excl=None):
-        cand = [a for a in pool if a is not excl
-                and 0.5 * length <= a["chars"] <= 2.0 * length]
-        if len(cand) < 2:
-            cand = [a for a in pool if a is not excl]
-        if not cand:
-            return None
-        ds = sorted(delta(vec, a["z"]) for a in cand)
-        return ds[min(len(ds) - 1, max(0, int(len(ds) * 0.9) - 1))]
+    sm_vals, fp_vals = [], []
+    for d in docs:
+        st_clean = scanner.strip_md_for_structure(d[1])
+        st_sents = [len(s) for s in scanner.split_sents(st_clean)]
+        sm_vals.append(statistics.mean(st_sents) if st_sents else len(d[1]))
+        narr_prose = scanner.QUOTE.sub("", st_clean).replace("￭", "")
+        fp_vals.append(len(re.findall(r"我|咱们", narr_prose)) / max(len(narr_prose.strip()) or len(d[1]), 1) * 1000)
+    sm_new = statistics.mean(sm_vals)
+    fp_new = statistics.mean(fp_vals)
+    if old and old.get("baseline"):
+        ob = old["baseline"]
+        w_b = max(n_old + n_new, 1e-6)
+        sm_merged = (ob.get("sent_mean", sm_new) * n_old + sm_new * n_new) / w_b
+        fp_merged = (ob.get("first_person", fp_new) * n_old + fp_new * n_new) / w_b
+    else:
+        sm_merged, fp_merged = sm_new, fp_new
 
     ctrl = []
-    for i, (f, t, v) in enumerate(docs):
-        thr = _entry(zscore(v, mu, sd), len(t), anchors, excl=anchors[len(anchors) - len(docs) + i])
-        own = delta(zscore(v, mu, sd), anchors[len(anchors) - len(docs) + i]["z"])
-        if thr is not None:
+    for (f, t, v), self_a in zip(docs, new_anchor_objs):
+        zv_doc = zscore(v, mu, sd)
+        cand = [a for a in anchors if a is not self_a and 0.5 * len(t) <= a["chars"] <= 2.0 * len(t)]
+        if len(cand) < 2:
+            cand = [a for a in anchors if a is not self_a]
+        if len(cand) >= 2:
+            pair_ds = sorted(delta(cand[x]["z"], cand[y]["z"])
+                             for x in range(len(cand)) for y in range(x + 1, len(cand)))
+            thr = pair_ds[min(len(pair_ds) - 1, max(0, int(len(pair_ds) * 0.9) - 1))]
+            own = min(delta(zv_doc, a["z"]) for a in cand)
             ctrl.append(1.0 if own <= thr else 0.0)
 
     prof = {
@@ -338,8 +387,8 @@ def build(paths, append=False, store=STORE, min_chars=None):
                    "n": round((old or {}).get("within", {}).get("n", 0) * DECAY + max(len(within), 1), 2)},
         "anchors": anchors,
         "baseline": {
-            "sent_mean": round(statistics.mean([statistics.mean([len(s) for s in scanner.split_sents(d[1])]) for d in docs]), 2),
-            "first_person": round(statistics.mean([len(re.findall(r"我|咱们", d[1])) / max(len(d[1]), 1) * 1000 for d in docs]), 2),
+            "sent_mean": round(sm_merged, 2),
+            "first_person": round(fp_merged, 2),
         },
         "tolerance": 1.5,
         "s_tolerance": 2.5,
@@ -365,24 +414,24 @@ def build(paths, append=False, store=STORE, min_chars=None):
 def _need(store):
     p = load(store)
     if not p or not p.get("mu"):
-        sys.stderr.write("没有画像。先跑：python profile.py build 你的旧稿目录/\n")
+        sys.stderr.write("没有画像。先跑：python style_profile.py build 你的旧稿目录/\n")
         return None
     return p
 
 
-
 def descriptor(prof):
-    """把数值指纹转成自然语言描述。依据 StyloPrompt（AIED 2026）：
-    NL-Distribution 编码比直接给数值更能约束模型。"""
     b = prof["baseline"]
     sm = b["sent_mean"]
     fp = b["first_person"]
     parts = []
-    parts.append("句长以 %s 字为主" % ("八到十五" if sm < 16 else "十五到二十二" if sm < 23 else "二十二到三十二" if sm < 33 else "三十字以上"))
+    parts.append("句长以 %s 字为主" % (
+        "八到十五" if sm < 16 else "十五到二十二" if sm < 23 else "二十二到三十二" if sm < 33 else "三十字以上"))
     parts.append("第一人称%s" % ("很密，几乎每段都有" if fp > 25 else "常有，但不铺满" if fp > 8 else "少用，偏客观叙述"))
     r = (prof.get("rules") or {})
+
     def rate(k):
         return (r.get(k) or {}).get("mean", 0)
+
     if rate("em_dash") > 2:
         parts.append("破折号是你的常用手段，约每千字 %.0f 处，不必刻意回避" % rate("em_dash"))
     elif rate("em_dash") < 0.5:
@@ -393,17 +442,12 @@ def descriptor(prof):
         parts.append("不用「核心是：」这类提示语冒号，也不用冒号引列表")
     if rate("flip") < 0.05:
         parts.append("不写「不是A而是B」式翻案句")
-    parts.append("组内变异宽度：你自己各篇之间的 Delta 均值 %.3f，最大 %.3f，比较的基准是这条线，不是满分" % (prof["within"]["mean"], prof["within"]["max"]))
+    parts.append("组内变异宽度：你自己各篇之间的 Delta 均值 %.3f，最大 %.3f，比较的基准是这条线，不是满分"
+                 % (prof["within"]["mean"], prof["within"]["max"]))
     return "；".join(parts) + "。"
 
 
 def envelope_entry(text, prof):
-    """判断本篇是否落在作者的组内变异包络内。
-
-    包络由作者自己各篇之间的距离决定，不用「稿件到锚点的距离」定阈值，
-    否则任何稿件都会落在自己的分位数里，判定失效。
-    长度匹配依据 The Width of a Voice（2026）：包络随文档长度变化。
-    """
     v = zscore(vector(text), prof["mu"], prof["sd"])
     n = len(text)
     anchors = prof.get("anchors", [])
@@ -414,7 +458,6 @@ def envelope_entry(text, prof):
     if not pool:
         return None
 
-    # 阈值：池内作者各篇之间的最大距离（至少两篇才能算）
     pair = []
     for i in range(len(pool)):
         for j in range(i + 1, len(pool)):
@@ -430,6 +473,17 @@ def envelope_entry(text, prof):
     return {"dist": own, "thr": thr, "inside": own <= thr,
             "n": len(pool), "length_matched": matched}
 
+
+def select_exemplars(prof, query_text=None, k=3):
+    anchors = prof.get("anchors", [])
+    if not anchors:
+        return []
+    if query_text and query_text.strip():
+        target_z = zscore(vector(query_text), prof["mu"], prof["sd"])
+    else:
+        target_z = [0.0] * len(prof.get("mu", FEATS))
+    scored = sorted(((delta(target_z, a["z"]), a) for a in anchors), key=lambda x: x[0])
+    return [a for _, a in scored[:k]]
 
 
 def card(name="self", store=None, k=3):
@@ -450,9 +504,9 @@ def card(name="self", store=None, k=3):
     print("## 表达 DNA")
     print(descriptor(prof))
     print()
-    print("## 语料样例（KATE 最近 %d 段，优先于任何描述）" % k)
-    for a in prof.get("anchors", [])[-k:]:
-        print("- [%s｜%d 字] %s" % (a["src"], a["chars"], a["text"].replace("\n", " ")[:110]))
+    print("## 代表性语料样例（中心最近 %d 段，优先于任何抽象描述）" % k)
+    for a in select_exemplars(prof, None, k=k):
+        print("- [%s｜%d 字] %s" % (a["src"], a["chars"], a["text"].replace("\n", " ")))
     print()
     print("## 诚实边界")
     print("- 蒸馏的是表面纹理。实测显示风格提示几乎不动功能词结构（The Width of a Voice 2026）。")
@@ -461,8 +515,8 @@ def card(name="self", store=None, k=3):
     print("- 本卡不主张作者身份，只描述统计距离。")
     print()
     print("## 用法")
-    print("1 把本卡与场景要求一起放进上下文；2 按样例的句法写，不要照抄内容；")
-    print("3 写完跑 profile.py check 稿件 --name %s 复检 Delta，落在包络外就重写。" % name)
+    print("1 用 kickoff.py --profile %s 自动将本卡 DNA 与最近邻样例注入开局；" % name)
+    print("2 写完跑 loop.py 或 style_profile.py check 复检 Delta。")
     return 0
 
 
@@ -487,38 +541,87 @@ def delta_of(text, prof):
 
 
 def percentile(d, prof):
-    """用组内 Delta 的均值与最大值做粗略分档，不做正态假设。"""
     w = prof["within"]
     if w["max"] <= w["mean"]:
         return 0
     return max(0, min(100, int((d - w["mean"]) / max(w["max"] - w["mean"], 1e-6) * 50 + 50)))
 
 
-def drift(path, store=STORE, win=200):
+def _sentence_windows(text, win=200):
+    """按完整句界聚合滚动窗口，避免硬切截断多字功能词与伪造短残句污染句长分箱。"""
+    chunks = []
+    buf = ""
+    start = None
+    for m in re.finditer(r"[^。！？；\n]*[。！？；\n]+|[^\n]+$", text):
+        piece = m.group()
+        if not piece:
+            continue
+        off = m.start()
+        if len(piece) > win * 1.6:
+            if buf.strip() and len(buf.strip()) >= 60:
+                chunks.append((start, buf))
+            buf, start = "", None
+            for k in range(0, len(piece), win):
+                sub_s = piece[k:k + win]
+                if len(sub_s.strip()) >= 60:
+                    chunks.append((off + k, sub_s))
+            continue
+        if start is None:
+            start = off
+        if buf and len(buf) + len(piece) > win and len(buf.strip()) >= 60:
+            chunks.append((start, buf))
+            start, buf = off, piece
+        else:
+            buf += piece
+    if buf.strip() and len(buf.strip()) >= 60:
+        chunks.append((start if start is not None else 0, buf))
+    return chunks
+
+
+def drift(path, store=STORE, win=200, as_json=False):
     prof = _need(store)
     if not prof:
         return 2
-    t = open(path, encoding="utf-8").read()
-    chunks, i = [], 0
-    while i < len(t):
-        seg = t[i:i + win]
-        if len(seg.strip()) >= 60:
-            chunks.append((i, seg))
-        i += win
+    t = scanner.read_text(path)
+    line_starts = scanner.build_line_index(t)
+    chunks = _sentence_windows(t, win=win)
     if not chunks:
-        print("稿件太短，无法做滚动 Delta")
+        if as_json:
+            print(json.dumps({"ok": True, "windows": [], "note": "稿件太短，无法做滚动 Delta"},
+                             ensure_ascii=False, indent=2))
+        else:
+            print("稿件太短，无法做滚动 Delta")
         return 0
-    print("滚动 Delta（窗口 %d 字）｜ 组内基准 均值 %.4f 最大 %.4f"
-          % (win, prof["within"]["mean"], prof["within"]["max"]))
-    print("%-6s %-8s %8s %8s %s" % ("偏移", "字数", "最小Δ", "百分位", "段首"))
     rows = []
     for off, seg in chunks:
-        dmin, dmean, _ = delta_of(seg, prof)
-        rows.append((off, len(seg), dmin, percentile(dmin, prof), seg.strip()[:24].replace("\n", " ")))
-    for r in sorted(rows, key=lambda x: -x[2])[:10]:
-        print("%-6d %-8d %8.4f %7d%% %s" % r)
+        dmin, _, _ = delta_of(seg, prof)
+        l_s, l_e = scanner.offset_span_to_lines(t, off, len(seg), line_starts)
+        rows.append({
+            "line_start": l_s,
+            "line_end": l_e,
+            "chars": len(seg),
+            "delta_min": round(dmin, 4),
+            "percentile": percentile(dmin, prof),
+            "head": seg.strip()[:26].replace("\n", " "),
+        })
+    rows.sort(key=lambda x: -x["delta_min"])
+    if as_json:
+        print(json.dumps({
+            "ok": True,
+            "window": win,
+            "within": prof["within"],
+            "windows": rows,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    print("滚动 Delta（整句窗口 ~%d 字）｜ 组内基准 均值 %.4f 最大 %.4f"
+          % (win, prof["within"]["mean"], prof["within"]["max"]))
+    print("%-11s %-7s %8s %8s %s" % ("行号区间", "字数", "最小Δ", "百分位", "段首"))
+    for r in rows[:10]:
+        l_tag = "行%d-%d" % (r["line_start"], r["line_end"])
+        print("%-11s %-7d %8.4f %7d%% %s"
+              % (l_tag, r["chars"], r["delta_min"], r["percentile"], r["head"]))
     print()
-    print("Δ 越小越像你本人。最大值那段是最不像你写的，优先改那一段。")
+    print("Δ 越小越像你本人。最大值那段偏离最远，优先按行号区间改那一段。")
     return 0
 
 
@@ -526,11 +629,11 @@ def exemplar(path, store=STORE, k=3, para=None):
     prof = _need(store)
     if not prof:
         return 2
-    t = open(path, encoding="utf-8").read()
+    t = scanner.read_text(path)
     if para:
-        seg = t.split("\n\n")[para - 1]
+        paras = [p for p in t.split("\n\n") if p.strip()]
+        seg = paras[min(max(para - 1, 0), len(paras) - 1)] if paras else t
     else:
-        # 取全文向量
         seg = t
     _, _, zv = delta_of(seg, prof)
     scored = sorted(((delta(zv, a["z"]), a) for a in prof.get("anchors", [])), key=lambda x: x[0])
@@ -541,24 +644,15 @@ def exemplar(path, store=STORE, k=3, para=None):
     return 0
 
 
-def check(path, store=STORE):
+def check(path, store=STORE, as_json=False):
     prof = _need(store)
     if not prof:
         return 2
-    t = open(path, encoding="utf-8").read()
+    t = scanner.read_text(path)
     dmin, dmean, zv = delta_of(t, prof)
     w = prof["within"]
     en = envelope_entry(t, prof)
     ctrl = (prof.get("control") or {})
-    print("注意：本功能未通过区分度验证。同作者留出段 Delta 0.4145，异作者（鲁迅）0.3071，"
-          "排序错误。以下数值只作相对比较，不可据此判定作者。")
-    print("个人基线 %s ｜ %d 篇 / %d 字 ｜ 特征 %d 维 ｜ 锚点 %d 段"
-          % (prof["updated_at"], prof["samples"]["files"], prof["samples"]["chars"],
-             prof["features_n"], len(prof.get("anchors", []))))
-    if ctrl.get("entry_rate") is not None:
-        print("正对照：你留出的旧稿回落自己包络的比例 %.0f%%（参考区间 84%% 至 88%%）"
-              % (ctrl["entry_rate"] * 100))
-    # 最小有效规模：低于此规模，包络区分度实测不足，直接拒绝判定，不放行
     corpus_chars = prof["samples"]["chars"]
     n_files = prof["samples"]["files"]
     med_all = statistics.median([a["chars"] for a in prof.get("anchors", [])]) if prof.get("anchors") else 0
@@ -566,6 +660,32 @@ def check(path, store=STORE):
     med = med_all
     ratio = (len(t) / med) if med else 1.0
     mismatch = bool(med) and (ratio < 0.6 or ratio > 1.7)
+    vec = vector(t)
+    devs = sorted(((abs(z), FEATS[i], vec[i], prof["mu"][i])
+                   for i, z in enumerate(zv)), key=lambda x: -x[0])[:8]
+    if as_json:
+        print(json.dumps({
+            "ok": True,
+            "samples": prof["samples"],
+            "within": w,
+            "envelope": en,
+            "weak_corpus": weak,
+            "length_mismatch": mismatch,
+            "delta_min": round(dmin, 4),
+            "delta_mean": round(dmean, 4),
+            "top_deviations": [
+                {"feature": name, "current_per_kilo": round(cur, 2),
+                 "profile_mean": round(mu, 2), "abs_z": round(z, 2)}
+                for z, name, cur, mu in devs
+            ],
+        }, ensure_ascii=False, indent=2))
+        return 0
+    print("个人基线 %s ｜ %d 篇 / %d 字 ｜ 特征 %d 维 ｜ 锚点 %d 段"
+          % (prof["updated_at"], prof["samples"]["files"], prof["samples"]["chars"],
+             prof["features_n"], len(prof.get("anchors", []))))
+    if ctrl.get("entry_rate") is not None:
+        print("正对照：你留出的旧稿回落自己包络的比例 %.0f%%（参考区间 84%% 至 88%%）"
+              % (ctrl["entry_rate"] * 100))
     print()
     if en:
         print("包络判定 本篇 Delta %.4f ｜ 本长度档阈值 %.4f ｜ 参照锚点 %d 段%s"
@@ -585,9 +705,6 @@ def check(path, store=STORE):
     print()
     print("距离 最近锚点 %.4f ｜ 平均 %.4f ｜ 组内均值 %.4f 最大 %.4f"
           % (dmin, dmean, w["mean"], w["max"]))
-    vec = vector(t)
-    devs = sorted(((abs(z), FEATS[i], vec[i], prof["mu"][i])
-                   for i, z in enumerate(zv)), key=lambda x: -x[0])[:8]
     print()
     print("%-10s %10s %10s %8s" % ("偏离最大的特征", "本篇/千字", "你的均值", "z"))
     for z, name, cur, mu in devs:
@@ -627,11 +744,12 @@ def main():
     b.add_argument("paths", nargs="+")
     b.add_argument("--append", action="store_true")
     b.add_argument("--name", default="self", help="画像名，用于区分你自己的风格与目标作家")
-    b.add_argument("--min-chars", type=int, default=None, help="单篇最低字数，默认 150。调低会让包络不稳")
+    b.add_argument("--min-chars", type=int, default=None, help="单篇最低字数，默认 150")
     d = sub.add_parser("drift", help="滚动 Delta，定位最不像作者的段落")
     d.add_argument("file")
     d.add_argument("--win", type=int, default=200)
     d.add_argument("--name", default="self")
+    d.add_argument("--json", action="store_true", help="输出 JSON")
     e = sub.add_parser("exemplar", help="按 KATE 取最相近的作者旧稿片段")
     e.add_argument("file")
     e.add_argument("--k", type=int, default=3)
@@ -640,6 +758,7 @@ def main():
     c = sub.add_parser("check", help="对比单篇与个人基线")
     c.add_argument("file")
     c.add_argument("--name", default="self")
+    c.add_argument("--json", action="store_true", help="输出 JSON")
     sh = sub.add_parser("show")
     sh.add_argument("--name", default="self")
     cd = sub.add_parser("card", help="输出可直接放进上下文的风格卡")
@@ -652,11 +771,11 @@ def main():
     if a.cmd == "build":
         return build(a.paths, a.append, store_for(a.name), a.min_chars)
     if a.cmd == "drift":
-        return drift(a.file, store_for(a.name), win=a.win)
+        return drift(a.file, store_for(a.name), win=a.win, as_json=a.json)
     if a.cmd == "exemplar":
         return exemplar(a.file, store_for(a.name), k=a.k, para=a.para)
     if a.cmd == "check":
-        return check(a.file, store_for(a.name))
+        return check(a.file, store_for(a.name), as_json=a.json)
     if a.cmd == "show":
         return show(store_for(a.name))
     if a.cmd == "card":
