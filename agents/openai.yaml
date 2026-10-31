@@ -1,0 +1,8 @@
+interface:
+  display_name: "Writing Loop 中文写作工作台"
+  short_description: "现代汉语章法领路、行号级去AI味微创扫描与本地文风闭环"
+  brand_color: "#1F2937"
+  default_prompt: "使用 $writing-loop 按现代汉语章法起草、扫描或微创润色这篇中文文稿。"
+
+policy:
+  allow_implicit_invocation: true

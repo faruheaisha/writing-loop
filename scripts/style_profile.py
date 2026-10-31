@@ -365,7 +365,7 @@ def build(paths, append=False, store=STORE, min_chars=None):
 
     prof = {
         "version": 2,
-        "method": "Burrows Delta, Manhattan on z-scores (本机实测优于 Cosine，见文件头)",
+        "method": "Burrows Delta (Manhattan on z-scores)",
         "features": FEATS,
         "features_n": len(FEATS),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -700,8 +700,7 @@ def check(path, store=STORE, as_json=False):
                   % (corpus_chars, n_files, med_all))
             print("结论：基线不足，不作判定。")
             return 0
-        print("定位：距离只描述差异，不判作者。2026-10 实测：对文风跨度大的作者，"
-              "AI 文（Delta 0.47）会比本人节选（0.76 至 0.87）更接近画像，包络无法区分人机。")
+        print("定位：统计距离只衡量表面文体差异，不区分人机，也不作作者身份鉴定。")
     print()
     print("距离 最近锚点 %.4f ｜ 平均 %.4f ｜ 组内均值 %.4f 最大 %.4f"
           % (dmin, dmean, w["mean"], w["max"]))

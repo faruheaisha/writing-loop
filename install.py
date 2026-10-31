@@ -33,8 +33,8 @@ RUNTIMES = [".workbuddy", ".claude", ".agents", ".codex"]
 
 DEV_SKIP_EXACT = {
     "install.py",
-    "writing_loop_2.0_deep_research_and_plan.md",
-    "writing_loop_knowledge_base.csv",
+    "README.md",
+    "tests",
 }
 
 
@@ -43,6 +43,7 @@ def candidates():
     out = [os.path.join(home, r, "skills") for r in RUNTIMES]
     out.append(os.path.join(os.getcwd(), ".claude", "skills"))
     out.append(os.path.join(os.getcwd(), ".agents", "skills"))
+    out.append(os.path.join(os.getcwd(), ".codex", "skills"))
     return out
 
 
@@ -62,9 +63,9 @@ def pick_target(explicit):
     return None, None
 
 
-def copy_skill(src, dst, extra_skip=()):
+def copy_skill(src, dst, extra_skip=(), skip_dev=True):
     shutil.rmtree(dst, ignore_errors=True)
-    skip_set = set(extra_skip) | DEV_SKIP_EXACT
+    skip_set = set(extra_skip) | (DEV_SKIP_EXACT if skip_dev else set())
 
     def _ignore(directory, names):
         is_root = os.path.abspath(directory) == os.path.abspath(src)
@@ -128,7 +129,7 @@ def main():
     print("已装 %s（含内嵌检测引擎）" % SKILL_NAME)
 
     if a.standalone_engine and os.path.isdir(ENGINE_SRC):
-        copy_skill(ENGINE_SRC, engine_dst)
+        copy_skill(ENGINE_SRC, engine_dst, skip_dev=False)
         tpl = os.path.join(engine_dst, "SKILL.md.template")
         if os.path.isfile(tpl):
             os.replace(tpl, os.path.join(engine_dst, "SKILL.md"))
@@ -152,10 +153,10 @@ def main():
     else:
         print("已跳过权重下载（章法、扫描与画像立即可用）")
 
-    test = os.path.join(skill_dst, "tests", "run_tests.py")
+    test = os.path.join(HERE, "tests", "run_tests.py")
     if os.path.isfile(test):
         print("自测：")
-        subprocess.run([sys.executable, test], cwd=skill_dst, check=False)
+        subprocess.run([sys.executable, test], cwd=HERE, check=False)
 
     print()
     print("完成。常用命令：")

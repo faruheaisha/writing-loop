@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (C) 2026 faruheaisha
 # SPDX-License-Identifier: GPL-3.0-only
-"""writing-loop 2.2 全量回归测试套件（128 项断言，零第三方依赖）。
+"""writing-loop 2.2 全量回归测试套件（136 项断言，零第三方依赖）。
 
 覆盖 15 个验证组：
   A 召回         全部 33 项正则规则的正例检出（33 项）
@@ -19,7 +19,7 @@
   L 开局组装     10 场景、别名兼容、语域旋钮与微骨架、个人 DNA 联动注入（8 项）
   M 零返工定位   正则与段落同构/零主语精确 [行L] 坐标、首句大纲、loop 行号区间（5 项）
   N Markdown免疫 代码块/表格/链接URL遮罩、带序号小标题复读检出（5 项）
-  O 协议与卫生   GPL-3.0 协议校验、engine SHA256 锁定、文档零自违、全仓纯 LF（7 项）
+  O 双端规范与干货 Anthropic+OpenAI 技能解析规范、干货纯净度、GPLv3、SHA256、纯LF无BOM（15 项）
 
 用法：python tests/run_tests.py [-v]
 退出码：0 全过，1 有失败。
@@ -523,23 +523,154 @@ md_link_m = scan.scan(md_link_doc)["metrics"]
 ok("N", "Markdown超长链接URL自动遮罩不虚增句长与字数分母",
    md_link_m["chars"] < 25 and (md_link_m["sent_mean"] or 99) < 25)
 
-# ---------------------------------------------------------------- O 协议合规、引擎锁定与全仓卫生 (7)
+# ---------------------------------------------------------------- O 双端技能规范、干货纯净度与协议锁定 (15)
+def _parse_strict_yaml_map(raw_block):
+    """零依赖严格解析两级 YAML（校验无制表符、键名无引号、嵌套字符串显式双引号）。"""
+    top = {}
+    cur_map = None
+    for raw_ln in raw_block.splitlines():
+        if not raw_ln.strip() or raw_ln.lstrip().startswith("#"):
+            continue
+        if "\t" in raw_ln:
+            raise ValueError("tab character in YAML: " + repr(raw_ln))
+        indent = len(raw_ln) - len(raw_ln.lstrip(" "))
+        k, sep, v = raw_ln.strip().partition(":")
+        if not sep or not re.match(r"^[a-zA-Z0-9_-]+$", k):
+            raise ValueError("invalid YAML key: " + repr(raw_ln))
+        v = v.strip()
+        if indent == 0:
+            if not v:
+                cur_map = {}
+                top[k] = cur_map
+            else:
+                cur_map = None
+                top[k] = v
+        elif indent == 2 and isinstance(cur_map, dict):
+            cur_map[k] = v
+        else:
+            raise ValueError("unexpected YAML indent: " + repr(raw_ln))
+    return top
+
+
+def _unquote(v):
+    if isinstance(v, str) and len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
 skill_path = os.path.join(ROOT_DIR, "SKILL.md")
-skill_txt = open(skill_path, encoding="utf-8").read()
-fm_parts = skill_txt.split("---", 2)
-fm_bytes = len(fm_parts[1].encode("utf-8")) if len(fm_parts) >= 3 else 9999
-ok("O", "SKILL.md的YAML头小于600字节防截断与常驻膨胀", fm_bytes < 600, "bytes=%d" % fm_bytes)
-ok("O", "SKILL.md剔除编程易误触裸词(写脚本)并含显式代码排他边界",
-   "写脚本" not in fm_parts[1] and "程序脚本" in fm_parts[1] and "代码重构" in fm_parts[1])
-ok("O", "SKILL.md正文控制在140行内且无断链章节号",
-   len(skill_txt.splitlines()) <= 140 and "第四节底线" not in skill_txt,
-   "lines=%d" % len(skill_txt.splitlines()))
+skill_raw = open(skill_path, "rb").read()
+skill_txt = skill_raw.decode("utf-8")
+ok("O", "SKILL.md无UTF-8 BOM且以标准---换行开头（防OpenAI/Codex解析器拒绝）",
+   not skill_raw.startswith(b"\xef\xbb\xbf") and skill_raw.startswith(b"---\n"))
+
+fm_match = re.match(r"^---\n(.*?)\n---\n", skill_txt, re.DOTALL)
+fm_block = fm_match.group(1) if fm_match else ""
+fm_bytes = len(fm_block.encode("utf-8"))
+try:
+    fm_map = _parse_strict_yaml_map(fm_block) if fm_block else {}
+except Exception as _ye:
+    fm_map = {"__err__": str(_ye)}
+
+ALLOWED_SKILL_KEYS = {"name", "description", "license", "allowed-tools", "metadata", "compatibility"}
+ok("O", "SKILL.md顶层字段100%在Anthropic/OpenAI官方白名单内",
+   bool(fm_map) and set(fm_map.keys()).issubset(ALLOWED_SKILL_KEYS), str(list(fm_map.keys())))
+
+sk_name = _unquote(fm_map.get("name", ""))
+ok("O", "SKILL.md的name符合a-z0-9连字符规范且不含保留词",
+   sk_name == "writing-loop" and 1 <= len(sk_name) <= 64
+   and bool(re.match(r"^[a-z0-9]+(-[a-z0-9]+)*$", sk_name))
+   and "anthropic" not in sk_name and "claude" not in sk_name)
+
+raw_desc = fm_map.get("description", "")
+sk_desc = _unquote(raw_desc)
+ok("O", "SKILL.md的description双引号包裹、≤1024字符、零XML尖括号且含代码排他边界",
+   isinstance(raw_desc, str) and raw_desc.startswith('"') and raw_desc.endswith('"')
+   and 1 <= len(sk_desc) <= 1024 and "<" not in sk_desc and ">" not in sk_desc
+   and "写脚本" not in sk_desc and "程序脚本" in sk_desc and "代码重构" in sk_desc)
+
+raw_compat = fm_map.get("compatibility", "")
+sk_compat = _unquote(raw_compat)
+sk_meta = fm_map.get("metadata", {})
+ok("O", "SKILL.md的compatibility≤500字符且metadata值全为双引号字符串",
+   isinstance(raw_compat, str) and 1 <= len(sk_compat) <= 500
+   and "<" not in sk_compat and ">" not in sk_compat
+   and isinstance(sk_meta, dict) and bool(sk_meta)
+   and all(isinstance(mv, str) and mv.startswith('"') and mv.endswith('"') for mv in sk_meta.values()))
+
+ok("O", "SKILL.md的YAML头小于600字节且全文≤140行（远低于官方500行上限）",
+   fm_bytes < 600 and len(skill_txt.splitlines()) <= 140 and "第四节底线" not in skill_txt,
+   "bytes=%d,lines=%d" % (fm_bytes, len(skill_txt.splitlines())))
+
+md_rel_links = re.findall(r"\[[^\]]+\]\(([^)#]+)\)", skill_txt)
+links_ok = bool(md_rel_links) and all(
+    not lk.startswith(("http://", "https://", "/"))
+    and lk.count("/") == 1
+    and os.path.isfile(os.path.join(ROOT_DIR, lk))
+    for lk in md_rel_links
+)
+nested_ref_hops = []
+for ref_fn in os.listdir(os.path.join(ROOT_DIR, "references")):
+    if ref_fn.endswith(".md"):
+        rt = open(os.path.join(ROOT_DIR, "references", ref_fn), encoding="utf-8").read()
+        if re.search(r"\[[^\]]+\]\([^)]+\.md\)", rt) or re.search(r"(?:详见|写在|见)\s*`[^`]+\.md`", rt):
+            nested_ref_hops.append(ref_fn)
+ok("O", "SKILL.md引用链接均为单层相对路径且references内部零嵌套追读链",
+   links_ok and not nested_ref_hops, str({"links": md_rel_links, "nested": nested_ref_hops}))
+
+openai_yaml_p = os.path.join(ROOT_DIR, "agents", "openai.yaml")
+oy_raw = open(openai_yaml_p, "rb").read() if os.path.isfile(openai_yaml_p) else b""
+try:
+    oy_map = _parse_strict_yaml_map(oy_raw.decode("utf-8")) if oy_raw else {}
+except Exception as _oe:
+    oy_map = {"__err__": str(_oe)}
+oy_if = oy_map.get("interface", {}) if isinstance(oy_map.get("interface"), dict) else {}
+oy_pol = oy_map.get("policy", {}) if isinstance(oy_map.get("policy"), dict) else {}
+oy_short = _unquote(oy_if.get("short_description", ""))
+oy_prompt = _unquote(oy_if.get("default_prompt", ""))
+oy_color = _unquote(oy_if.get("brand_color", ""))
+ok("O", "agents/openai.yaml符合OpenAI界面规范（short_description 25-64字且含$writing-loop）",
+   bool(oy_raw) and not oy_raw.startswith(b"\xef\xbb\xbf") and b"\r\n" not in oy_raw
+   and 25 <= len(oy_short) <= 64
+   and "$writing-loop" in oy_prompt
+   and bool(re.match(r"^#[0-9A-Fa-f]{6}$", oy_color))
+   and oy_pol.get("allow_implicit_invocation") == "true",
+   "short_len=%d" % len(oy_short))
+
+all_skill_mds = []
+non_dry_clutter = []
+for walk_root, dirs, files in os.walk(ROOT_DIR):
+    dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+    for fn in files:
+        rel_f = os.path.relpath(os.path.join(walk_root, fn), ROOT_DIR).replace("\\", "/")
+        if fn == "SKILL.md":
+            all_skill_mds.append(rel_f)
+        if (fn.startswith(("writing_loop_", "specs_", "bench"))
+                or "测频" in fn
+                or fn.endswith((".csv", ".tmp", ".log", ".bak"))):
+            non_dry_clutter.append(rel_f)
+ok("O", "全仓仅唯一根级SKILL.md（零嵌套技能索引冲突）", all_skill_mds == ["SKILL.md"], str(all_skill_mds))
+ok("O", "仓库仅含技能干性内容（无测频表、调研文档与临时文件残留）",
+   not non_dry_clutter, str(non_dry_clutter))
+
+sys.path.insert(0, ROOT_DIR)
+import install as inst_mod
+with tempfile.TemporaryDirectory() as td_inst:
+    dst_inst = os.path.join(td_inst, "writing-loop")
+    inst_mod.copy_skill(ROOT_DIR, dst_inst)
+    ok("O", "install.py部署目标仅保留纯净运行时（含agents/openai.yaml且剥离tests/install.py）",
+       os.path.isfile(os.path.join(dst_inst, "SKILL.md"))
+       and os.path.isfile(os.path.join(dst_inst, "agents", "openai.yaml"))
+       and os.path.isfile(os.path.join(dst_inst, "scripts", "scan.py"))
+       and not os.path.exists(os.path.join(dst_inst, "install.py"))
+       and not os.path.exists(os.path.join(dst_inst, "README.md"))
+       and not os.path.exists(os.path.join(dst_inst, "tests")))
 
 lic_txt = open(os.path.join(ROOT_DIR, "LICENSE"), encoding="utf-8").read()
 notice_txt = open(os.path.join(ROOT_DIR, "NOTICE.md"), encoding="utf-8").read()
 ok("O", "根LICENSE采用完整GPL-3.0保守协议且与SKILL/NOTICE一致",
    "GNU GENERAL PUBLIC LICENSE" in lic_txt and "Version 3, 29 June 2007" in lic_txt
-   and "license: GPL-3.0-only" in fm_parts[1] and "GPL-3.0" in notice_txt)
+   and _unquote(fm_map.get("license", "")) == "GPL-3.0-only" and "GPL-3.0" in notice_txt)
 
 sums_file = os.path.join(ROOT_DIR, "engine", "SHA256SUMS.txt")
 engine_intact = os.path.isfile(sums_file)
@@ -571,15 +702,17 @@ doc_self_issues = (scan.scan(skill_txt, profile=None)["issues"]
 ok("O", "SKILL.md与README.md自身通过机械扫描零违例",
    len(doc_self_issues) == 0, str([i["id"] for i in doc_self_issues]))
 
-crlf_bad = []
+crlf_or_bom_bad = []
 for walk_root, dirs, files in os.walk(ROOT_DIR):
     dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "engine")]
     for fn in files:
-        if fn.endswith((".py", ".md", ".txt", ".csv", ".json")) or fn in ("LICENSE", ".gitignore", ".gitattributes"):
+        if (fn.endswith((".py", ".md", ".yaml", ".yml", ".txt", ".csv", ".json"))
+                or fn in ("LICENSE", ".gitignore", ".gitattributes")):
             full_p = os.path.join(walk_root, fn)
-            if b"\r\n" in open(full_p, "rb").read():
-                crlf_bad.append(os.path.relpath(full_p, ROOT_DIR))
-ok("O", "全仓自有代码、文档与配置文件100%纯LF无CRLF", not crlf_bad, str(crlf_bad))
+            raw_b = open(full_p, "rb").read()
+            if b"\r\n" in raw_b or raw_b.startswith(b"\xef\xbb\xbf"):
+                crlf_or_bom_bad.append(os.path.relpath(full_p, ROOT_DIR))
+ok("O", "全仓自有代码、YAML与文档100%纯LF且无UTF-8 BOM", not crlf_or_bom_bad, str(crlf_or_bom_bad))
 
 # ---------------------------------------------------------------- 汇总输出
 print("\n" + "=" * 56)

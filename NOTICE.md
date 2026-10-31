@@ -4,7 +4,7 @@
 
 Copyright (C) 2026 faruheaisha
 
-`writing-loop`（含 `SKILL.md`、`install.py`、`references/`、`scripts/`、`tests/` 及根目录研究文档，不含 `engine/` 目录）采用 **GNU General Public License v3.0（`GPL-3.0-only`）** 开源许可，完整协议全文见根目录 `LICENSE`。
+`writing-loop`（含 `SKILL.md`、`agents/`、`install.py`、`references/`、`scripts/`、`tests/`，不含 `engine/` 目录）采用 **GNU General Public License v3.0（`GPL-3.0-only`）** 开源许可，完整协议全文见根目录 `LICENSE`。
 
 - 任何复制、修改、打包或再分发本项目的衍生作品，均须保留原始版权声明，并以相同 `GPL-3.0` 协议开放完整源代码，禁止闭源商业封装分发。
 - 用户使用本工具起草、扫描、诊断或润色所产出的个人文稿，以及由用户本人语料构建的个人文风画像（`~/.writing-loop/profiles/`），其著作权与数据归用户本人独立享有，不受 `GPL-3.0` 传染约束。
